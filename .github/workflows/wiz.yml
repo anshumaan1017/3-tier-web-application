@@ -5,9 +5,12 @@ jobs:
   wiz-cli-image-scan:
     name: "Wiz-cli Image Scan"
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
     env:
       SCAN_PATH: "." # Set the relative path in the repo to build the image from
-      TAG: "main2025" # Set the tag to use for the image
+      TAG: "local/wiz-scan:${{ github.sha }}" # Set the tag to use for the image
       POLICY: "Default vulnerabilities policy" # Set the desired Wiz CLI policy to use
 
     # Use the Bash shell regardless whether the GitHub Actions runner is ubuntu-latest, macos-latest, or windows-latest
@@ -23,16 +26,32 @@ jobs:
       # It's possible to skip this step if this job is scheduled after an image-build job.
       # If that's the case, also set "Run wiz CLI docker image scan" step accordingly
       - name: Build the Docker image
-        run: cd $SCAN_PATH && docker build . --tag $TAG # Configure to fit the params you use to build your image
+        run: docker build "$SCAN_PATH" --tag "$TAG" # Configure to fit the params you use to build your image
 
       - name: Download Wiz CLI
-        run: curl -o wizcli https://downloads.wiz.io/v1/wizcli/latest/wizcli-linux-amd64 && chmod +x wizcli
+        run: curl -fsSL -o wizcli https://downloads.wiz.io/v1/wizcli/latest/wizcli-linux-amd64 && chmod +x wizcli
 
       - name: Run wiz-cli docker image scan
         env:
           WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
           WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
-        run: ./wizcli scan container-image $TAG --policies "$POLICY"
+        run: ./wizcli scan container-image "$TAG" --policies "$POLICY"
 
       - name: Fetch digest of Docker image for Graph enrichment
-        run: ./wizcli tag $TAG
+        env:
+          WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
+          WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
+        run: ./wizcli tag "$TAG"
+
+      - name: Run Trivy vulnerability scanner (SARIF)
+        uses: aquasecurity/trivy-action@0.20.0
+        with:
+          image-ref: ${{ env.TAG }}
+          format: sarif
+          output: trivy-results.sarif
+
+      - name: Upload SARIF to GitHub Security
+        if: ${{ always() }}
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
