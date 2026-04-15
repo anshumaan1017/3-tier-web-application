@@ -26,21 +26,35 @@ jobs:
       - name: Download Wiz CLI
         run: curl -L -o wizcli https://downloads.wiz.io/v1/wizcli/latest/wizcli-linux-amd64 && chmod +x wizcli
 
+      - name: Show Wiz CLI scan help
+        run: ./wizcli scan container-image --help || true
+
       - name: Run wiz-cli docker image scan
         env:
           WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
           WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
         run: |
-          ./wizcli scan container-image $TAG \
-          --policies "$POLICY" \
-          --client-id $WIZ_CLIENT_ID \
-          --client-secret $WIZ_CLIENT_SECRET
+          set -euo pipefail
+          SCAN_OUTPUT=$(./wizcli scan container-image "$TAG" \
+            --policies "$POLICY" \
+            --client-id "$WIZ_CLIENT_ID" \
+            --client-secret "$WIZ_CLIENT_SECRET" \
+            --stdout human 2>&1)
+          echo "$SCAN_OUTPUT"
 
       - name: Fetch digest of Docker image for Graph enrichment
+        continue-on-error: true
         env:
           WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
           WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
         run: |
-          ./wizcli tag $TAG \
-          --client-id $WIZ_CLIENT_ID \
-          --client-secret $WIZ_CLIENT_SECRET
+          set -euo pipefail
+          if docker image inspect "$TAG" >/dev/null 2>&1; then
+            IMAGE_ID=$(docker image inspect "$TAG" --format '{{.Id}}' | sed 's/^sha256://')
+            echo "Local image digest: sha256:${IMAGE_ID}"
+          else
+            echo "::warning::Local image not found for $TAG; continuing with tag reference."
+          fi
+          ./wizcli tag "$TAG" \
+            --client-id "$WIZ_CLIENT_ID" \
+            --client-secret "$WIZ_CLIENT_SECRET"
