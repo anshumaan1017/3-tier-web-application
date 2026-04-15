@@ -43,15 +43,3 @@ jobs:
           WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
         run: ./wizcli tag "$TAG"
 
-      - name: Run Trivy vulnerability scanner (SARIF)
-        uses: aquasecurity/trivy-action@0.20.0
-        with:
-          image-ref: ${{ env.TAG }}
-          format: sarif
-          output: trivy-results.sarif
-
-      - name: Upload SARIF to GitHub Security
-        if: ${{ (success() || failure()) && !cancelled() }}
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: trivy-results.sarif
