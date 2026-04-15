@@ -10,7 +10,7 @@ jobs:
       security-events: write
     env:
       SCAN_PATH: "." # Set the relative path in the repo to build the image from
-      TAG: "local/wiz-scan:${{ github.sha }}" # Set the tag to use for the image
+      TAG: "temp-scan/wiz:${{ github.sha }}" # Set the tag to use for the image
       POLICY: "Default vulnerabilities policy" # Set the desired Wiz CLI policy to use
 
     # Use the Bash shell regardless whether the GitHub Actions runner is ubuntu-latest, macos-latest, or windows-latest
