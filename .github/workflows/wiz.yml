@@ -1,6 +1,6 @@
 name: "wiz-cli-container-scan"
 
-on: [pull_request]
+on: [pull_request,push]
 
 jobs:
   wiz-cli-image-scan:
