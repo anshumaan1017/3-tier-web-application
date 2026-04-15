@@ -27,7 +27,12 @@ jobs:
         run: curl -L -o wizcli https://downloads.wiz.io/v1/wizcli/latest/wizcli-linux-amd64 && chmod +x wizcli
 
       - name: Show Wiz CLI scan help
-        run: ./wizcli scan container-image --help || true
+        run: |
+          if [ -x ./wizcli ]; then
+            ./wizcli scan container-image --help
+          else
+            echo "::warning::wizcli binary not found; skipping help output."
+          fi
 
       - name: Run wiz-cli docker image scan
         env:
@@ -48,8 +53,8 @@ jobs:
           WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
         run: |
           set -euo pipefail
-          if docker image inspect "$TAG" >/dev/null 2>&1; then
-            IMAGE_ID=$(docker image inspect "$TAG" --format '{{.Id}}')
+          IMAGE_ID=$(docker image inspect "$TAG" --format '{{.Id}}' 2>/dev/null || true)
+          if [ -n "$IMAGE_ID" ]; then
             echo "Local image digest: ${IMAGE_ID}"
           else
             echo "::warning::Local image not found for $TAG; continuing with tag reference."
