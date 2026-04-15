@@ -35,12 +35,11 @@ jobs:
           WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
         run: |
           set -euo pipefail
-          SCAN_OUTPUT=$(./wizcli scan container-image "$TAG" \
+          ./wizcli scan container-image "$TAG" \
             --policies "$POLICY" \
             --client-id "$WIZ_CLIENT_ID" \
             --client-secret "$WIZ_CLIENT_SECRET" \
-            --stdout human 2>&1)
-          echo "$SCAN_OUTPUT"
+            --stdout human
 
       - name: Fetch digest of Docker image for Graph enrichment
         continue-on-error: true
@@ -50,8 +49,8 @@ jobs:
         run: |
           set -euo pipefail
           if docker image inspect "$TAG" >/dev/null 2>&1; then
-            IMAGE_ID=$(docker image inspect "$TAG" --format '{{.Id}}' | sed 's/^sha256://')
-            echo "Local image digest: sha256:${IMAGE_ID}"
+            IMAGE_ID=$(docker image inspect "$TAG" --format '{{.Id}}')
+            echo "Local image digest: ${IMAGE_ID}"
           else
             echo "::warning::Local image not found for $TAG; continuing with tag reference."
           fi
