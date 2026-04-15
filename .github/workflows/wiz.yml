@@ -1,4 +1,4 @@
-name: "wiz-cli-container-scan"
+name: "wiz-cli"
 
 on: [pull_request,push]
 
@@ -33,8 +33,8 @@ jobs:
         run: |
           ./wizcli scan container-image $TAG \
           --policies "$POLICY" \
-          --id $WIZ_CLIENT_ID \
-          --secret $WIZ_CLIENT_SECRET
+          --client-id $WIZ_CLIENT_ID \
+          --client-secret $WIZ_CLIENT_SECRET
 
       - name: Fetch digest of Docker image for Graph enrichment
         env:
@@ -42,5 +42,5 @@ jobs:
           WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
         run: |
           ./wizcli tag $TAG \
-          --id $WIZ_CLIENT_ID \
-          --secret $WIZ_CLIENT_SECRET
+          --client-id $WIZ_CLIENT_ID \
+          --client-secret $WIZ_CLIENT_SECRET
