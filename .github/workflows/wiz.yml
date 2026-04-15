@@ -1,10 +1,9 @@
 name: "wiz-cli"
 
-on: [pull_request,push]
+on: [pull_request]
 
 jobs:
   wiz-cli-image-scan:
-    name: "Wiz-cli Image Scan"
     runs-on: ubuntu-latest
 
     env:
@@ -12,57 +11,50 @@ jobs:
       TAG: "docker-tag"
       POLICY: "Default vulnerabilities policy"
 
-    defaults:
-      run:
-        shell: bash
-
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v2
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Build the Docker image
+      - name: Build Docker image
         run: cd $SCAN_PATH && docker build . --tag $TAG
 
       - name: Download Wiz CLI
         run: curl -L -o wizcli https://downloads.wiz.io/v1/wizcli/latest/wizcli-linux-amd64 && chmod +x wizcli
 
-      - name: Show Wiz CLI scan help
-        run: |
-          if [ -x ./wizcli ]; then
-            ./wizcli scan container-image --help
-          else
-            echo "::warning::wizcli binary not found; skipping help output."
-          fi
-
-      - name: Run wiz-cli docker image scan
+      # ✅ VERBOSE SCAN (human-readable + sarif)
+      - name: Run Wiz scan (verbose + SARIF)
         env:
           WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
           WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
         run: |
-          set -euo pipefail
-          ./wizcli scan container-image "$TAG" \
-            --policies "$POLICY" \
-            --client-id "$WIZ_CLIENT_ID" \
-            --client-secret "$WIZ_CLIENT_SECRET" \
-            --stdout human
+          ./wizcli scan container-image $TAG \
+          --policies "$POLICY" \
+          --client-id $WIZ_CLIENT_ID \
+          --client-secret $WIZ_CLIENT_SECRET \
+          --stdout=human \
+          --sarif-output-file=wiz.sarif \
+          --log=wiz-debug.log
 
-      - name: Fetch digest of Docker image for Graph enrichment
-        continue-on-error: true
+      # ✅ Upload SARIF to GitHub Security tab (Wiz doc aligned)
+      - name: Upload SARIF report
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: wiz.sarif
+
+      # ✅ FIXED DIGEST FORMAT
+      - name: Get image digest
+        id: digest
+        run: |
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' $TAG || true)
+          echo "DIGEST=$DIGEST" >> $GITHUB_ENV
+          echo "Digest: $DIGEST"
+
+      - name: Tag image (Graph enrichment)
+        if: env.DIGEST != ''
         env:
           WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
           WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
         run: |
-          set -euo pipefail
-          if ! command -v docker >/dev/null 2>&1; then
-            echo "::warning::Docker CLI not found; tagging will use remote image tag reference."
-          else
-            IMAGE_ID=$(docker image inspect "$TAG" --format '{{.Id}}' 2>/dev/null || true)
-            if [ -n "$IMAGE_ID" ]; then
-              echo "Local image digest: ${IMAGE_ID}"
-            else
-              echo "::warning::Local image not found for ${TAG}; tagging will use remote image tag reference."
-            fi
-          fi
-          ./wizcli tag "$TAG" \
-            --client-id "$WIZ_CLIENT_ID" \
-            --client-secret "$WIZ_CLIENT_SECRET"
+          ./wizcli tag $DIGEST \
+          --client-id $WIZ_CLIENT_ID \
+          --client-secret $WIZ_CLIENT_SECRET
