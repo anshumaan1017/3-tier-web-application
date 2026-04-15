@@ -57,30 +57,23 @@ jobs:
             exit 1
           fi
 
-          report_url="$(jq -r '.reportUrl' wiz.json)"
+          IFS=$'\t' read -r report_url critical_count high_count medium_count low_count info_count policy_failed_count < <(
+            jq -r '
+              [
+                (.reportUrl // ""),
+                ([.result.discoveredPackages[]?.vulnerabilityFindings?.severities["criticalCount"] // 0] | add // 0),
+                ([.result.discoveredPackages[]?.vulnerabilityFindings?.severities["highCount"] // 0] | add // 0),
+                ([.result.discoveredPackages[]?.vulnerabilityFindings?.severities["mediumCount"] // 0] | add // 0),
+                ([.result.discoveredPackages[]?.vulnerabilityFindings?.severities["lowCount"] // 0] | add // 0),
+                ([.result.discoveredPackages[]?.vulnerabilityFindings?.severities["infoCount"] // 0] | add // 0),
+                (.result.failedPolicyMatches | length // 0)
+              ] | @tsv
+            ' wiz.json
+          )
+
           echo "Wiz report uploaded successfully: ${report_url}"
 
-          critical_count="$(jq -r '[.result.discoveredPackages[]?.vulnerabilityFindings?.severities["criticalCount"] // 0] | add // 0' wiz.json)"
-          high_count="$(jq -r '[.result.discoveredPackages[]?.vulnerabilityFindings?.severities["highCount"] // 0] | add // 0' wiz.json)"
-          medium_count="$(jq -r '[.result.discoveredPackages[]?.vulnerabilityFindings?.severities["mediumCount"] // 0] | add // 0' wiz.json)"
-          low_count="$(jq -r '[.result.discoveredPackages[]?.vulnerabilityFindings?.severities["lowCount"] // 0] | add // 0' wiz.json)"
-          info_count="$(jq -r '[.result.discoveredPackages[]?.vulnerabilityFindings?.severities["infoCount"] // 0] | add // 0' wiz.json)"
-          policy_failed_count="$(jq -r '.result.failedPolicyMatches | length // 0' wiz.json)"
-
-          echo "===== WIZ CONTAINER SCAN SUMMARY ====="
-          echo "| Severity | Count |"
-          echo "|---|---:|"
-          echo "| Critical | ${critical_count} |"
-          echo "| High | ${high_count} |"
-          echo "| Medium | ${medium_count} |"
-          echo "| Low | ${low_count} |"
-          echo "| Info | ${info_count} |"
-          echo "| Failed policy matches | ${policy_failed_count} |"
-          echo "| Report URL | ${report_url} |"
-
-          {
-            echo "### Wiz Container Scan Summary"
-            echo ""
+          render_wiz_table() {
             echo "| Severity | Count |"
             echo "|---|---:|"
             echo "| Critical | ${critical_count} |"
@@ -89,6 +82,16 @@ jobs:
             echo "| Low | ${low_count} |"
             echo "| Info | ${info_count} |"
             echo "| Failed policy matches | ${policy_failed_count} |"
+            echo "| Report URL | ${report_url} |"
+          }
+
+          echo "===== WIZ CONTAINER SCAN SUMMARY ====="
+          render_wiz_table
+
+          {
+            echo "### Wiz Container Scan Summary"
+            echo ""
+            render_wiz_table
             echo ""
             echo "[Open Wiz report](${report_url})"
           } >> "$GITHUB_STEP_SUMMARY"
