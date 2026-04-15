@@ -57,7 +57,7 @@ jobs:
           if [ -n "$IMAGE_ID" ]; then
             echo "Local image digest: ${IMAGE_ID}"
           else
-            echo "::warning::Local image not found for $TAG; continuing with tag reference."
+            echo "::warning::Local image not found for $TAG; tagging will use remote image tag reference."
           fi
           ./wizcli tag "$TAG" \
             --client-id "$WIZ_CLIENT_ID" \
