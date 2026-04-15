@@ -53,11 +53,15 @@ jobs:
           WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
         run: |
           set -euo pipefail
-          IMAGE_ID=$(docker image inspect "$TAG" --format '{{.Id}}' 2>/dev/null || true)
-          if [ -n "$IMAGE_ID" ]; then
-            echo "Local image digest: ${IMAGE_ID}"
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "::warning::Docker CLI not found; tagging will use remote image tag reference."
           else
-            echo "::warning::Local image not found for $TAG; tagging will use remote image tag reference."
+            IMAGE_ID=$(docker image inspect "$TAG" --format '{{.Id}}' 2>/dev/null || true)
+            if [ -n "$IMAGE_ID" ]; then
+              echo "Local image digest: ${IMAGE_ID}"
+            else
+              echo "::warning::Local image not found for ${TAG}; tagging will use remote image tag reference."
+            fi
           fi
           ./wizcli tag "$TAG" \
             --client-id "$WIZ_CLIENT_ID" \
