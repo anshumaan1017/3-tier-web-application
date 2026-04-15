@@ -2,7 +2,6 @@ name: "wiz-cli"
 
 on:
   pull_request:
-  push:
 
 jobs:
   wiz-cli-image-scan:
@@ -19,7 +18,7 @@ jobs:
         shell: bash
 
     steps:
-      # Checkout repo
+      # Checkout
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -35,24 +34,23 @@ jobs:
           curl -L -o wizcli https://downloads.wiz.io/v1/wizcli/latest/wizcli-linux-amd64
           chmod +x wizcli
 
-      # Authenticate Wiz CLI (IMPORTANT for v1)
-      - name: Authenticate to Wiz
+      - name: Scan Docker Image
         env:
           WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
           WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
         run: |
-          ./wizcli auth login \
-            --client-id $WIZ_CLIENT_ID \
-            --client-secret $WIZ_CLIENT_SECRET
-
-      # Scan Docker image
-      - name: Scan Docker Image
-        run: |
           ./wizcli scan container-image $TAG \
             --policy "$POLICY" \
+            --id $WIZ_CLIENT_ID \
+            --secret $WIZ_CLIENT_SECRET \
             --exit-code-on-failure
 
-      # Optional: Tag image for Wiz Graph
+      # Optional: Tag image
       - name: Tag image (Graph enrichment)
+        env:
+          WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
+          WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
         run: |
-          ./wizcli tag $TAG
+          ./wizcli tag $TAG \
+            --id $WIZ_CLIENT_ID \
+            --secret $WIZ_CLIENT_SECRET
