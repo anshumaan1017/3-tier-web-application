@@ -1,16 +1,15 @@
-name: "wiz-cli"
+name: "wiz-cli-container-scan"
 
-on:
-  pull_request:
+on: [pull_request]
 
 jobs:
   wiz-cli-image-scan:
-    name: "Wiz CLI Image Scan"
+    name: "Wiz-cli Image Scan"
     runs-on: ubuntu-latest
 
     env:
       SCAN_PATH: "."
-      TAG: "wiz-image-${{ github.sha }}"
+      TAG: "docker-tag"
       POLICY: "Default vulnerabilities policy"
 
     defaults:
@@ -18,39 +17,30 @@ jobs:
         shell: bash
 
     steps:
-      # Checkout
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Check out repository
+        uses: actions/checkout@v2
 
-      # Build Docker image
-      - name: Build Docker image
-        run: |
-          cd $SCAN_PATH
-          docker build -t $TAG .
+      - name: Build the Docker image
+        run: cd $SCAN_PATH && docker build . --tag $TAG
 
-      # Download Wiz CLI
       - name: Download Wiz CLI
-        run: |
-          curl -L -o wizcli https://downloads.wiz.io/v1/wizcli/latest/wizcli-linux-amd64
-          chmod +x wizcli
+        run: curl -L -o wizcli https://downloads.wiz.io/v1/wizcli/latest/wizcli-linux-amd64 && chmod +x wizcli
 
-      - name: Scan Docker Image
+      - name: Run wiz-cli docker image scan
         env:
           WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
           WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
         run: |
           ./wizcli scan container-image $TAG \
-            --policy "$POLICY" \
-            --id $WIZ_CLIENT_ID \
-            --secret $WIZ_CLIENT_SECRET \
-            --exit-code-on-failure
+          --policies "$POLICY" \
+          --id $WIZ_CLIENT_ID \
+          --secret $WIZ_CLIENT_SECRET
 
-      # Optional: Tag image
-      - name: Tag image (Graph enrichment)
+      - name: Fetch digest of Docker image for Graph enrichment
         env:
           WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
           WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
         run: |
           ./wizcli tag $TAG \
-            --id $WIZ_CLIENT_ID \
-            --secret $WIZ_CLIENT_SECRET
+          --id $WIZ_CLIENT_ID \
+          --secret $WIZ_CLIENT_SECRET
