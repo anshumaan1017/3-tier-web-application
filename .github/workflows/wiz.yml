@@ -1,28 +1,34 @@
-name: "wiz-cli"
+name: wiz-cli
 
-on: [pull_request,push]
+on:
+  push:
 
 jobs:
-  wiz-cli-image-scan:
+  wiz-scan:
     runs-on: ubuntu-latest
 
     env:
-      SCAN_PATH: "."
-      TAG: "docker-tag"
+      TAG: docker-tag
       POLICY: "Default vulnerabilities policy"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build Docker image
-        run: cd $SCAN_PATH && docker build . --tag $TAG
+      - name: Build image
+        run: docker build . -t $TAG
 
-      - name: Download Wiz CLI
-        run: curl -L -o wizcli https://downloads.wiz.io/v1/wizcli/latest/wizcli-linux-amd64 && chmod +x wizcli
+      - name: Install wizcli
+        run: |
+          curl -L -o wizcli https://downloads.wiz.io/v1/wizcli/latest/wizcli-linux-amd64
+          chmod +x wizcli
 
-      # ✅ VERBOSE SCAN (human-readable + sarif)
-      - name: Run Wiz scan (verbose + SARIF)
+      - name: Wiz help
+        run: |
+          ./wizcli --help
+          ./wizcli scan container-image --help
+
+      - name: Run Wiz Container Scan
         env:
           WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
           WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
@@ -31,30 +37,14 @@ jobs:
           --policies "$POLICY" \
           --client-id $WIZ_CLIENT_ID \
           --client-secret $WIZ_CLIENT_SECRET \
-          --stdout=human \
-          --sarif-output-file=wiz.sarif \
-          --log=wiz-debug.log
+          --stdout=json \
+          --json-output-file=wiz.json \
+          --sarif-output-file=wiz.sarif
 
-      # ✅ Upload SARIF to GitHub Security tab (Wiz doc aligned)
-      - name: Upload SARIF report
+          echo "===== SCAN OUTPUT ====="
+          cat wiz.json
+
+      - name: Upload sarif
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: wiz.sarif
-
-      # ✅ FIXED DIGEST FORMAT
-      - name: Get image digest
-        id: digest
-        run: |
-          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' $TAG || true)
-          echo "DIGEST=$DIGEST" >> $GITHUB_ENV
-          echo "Digest: $DIGEST"
-
-      - name: Tag image (Graph enrichment)
-        if: env.DIGEST != ''
-        env:
-          WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
-          WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
-        run: |
-          ./wizcli tag $DIGEST \
-          --client-id $WIZ_CLIENT_ID \
-          --client-secret $WIZ_CLIENT_SECRET
