@@ -26,21 +26,43 @@ jobs:
       - name: Download Wiz CLI
         run: curl -L -o wizcli https://downloads.wiz.io/v1/wizcli/latest/wizcli-linux-amd64 && chmod +x wizcli
 
+      - name: Show Wiz CLI scan help
+        run: |
+          if [ -x ./wizcli ]; then
+            ./wizcli scan container-image --help
+          else
+            echo "::warning::wizcli binary not found; skipping help output."
+          fi
+
       - name: Run wiz-cli docker image scan
         env:
           WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
           WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
         run: |
-          ./wizcli scan container-image $TAG \
-          --policies "$POLICY" \
-          --client-id $WIZ_CLIENT_ID \
-          --client-secret $WIZ_CLIENT_SECRET
+          set -euo pipefail
+          ./wizcli scan container-image "$TAG" \
+            --policies "$POLICY" \
+            --client-id "$WIZ_CLIENT_ID" \
+            --client-secret "$WIZ_CLIENT_SECRET" \
+            --stdout human
 
       - name: Fetch digest of Docker image for Graph enrichment
+        continue-on-error: true
         env:
           WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
           WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
         run: |
-          ./wizcli tag $TAG \
-          --client-id $WIZ_CLIENT_ID \
-          --client-secret $WIZ_CLIENT_SECRET
+          set -euo pipefail
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "::warning::Docker CLI not found; tagging will use remote image tag reference."
+          else
+            IMAGE_ID=$(docker image inspect "$TAG" --format '{{.Id}}' 2>/dev/null || true)
+            if [ -n "$IMAGE_ID" ]; then
+              echo "Local image digest: ${IMAGE_ID}"
+            else
+              echo "::warning::Local image not found for ${TAG}; tagging will use remote image tag reference."
+            fi
+          fi
+          ./wizcli tag "$TAG" \
+            --client-id "$WIZ_CLIENT_ID" \
+            --client-secret "$WIZ_CLIENT_SECRET"
