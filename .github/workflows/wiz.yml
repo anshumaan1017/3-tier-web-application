@@ -1,38 +1,58 @@
 name: "wiz-cli"
-on: [pull_request,push]
+
+on:
+  pull_request:
+  push:
 
 jobs:
   wiz-cli-image-scan:
-    name: "Wiz-cli Image Scan"
+    name: "Wiz CLI Image Scan"
     runs-on: ubuntu-latest
-    env:
-      SCAN_PATH: "." # Set the relative path in the repo to build the image from
-      TAG: "main2025" # Set the tag to use for the image
-      POLICY: "Default vulnerabilities policy" # Set the desired Wiz CLI policy to use
 
-    # Use the Bash shell regardless whether the GitHub Actions runner is ubuntu-latest, macos-latest, or windows-latest
+    env:
+      SCAN_PATH: "."
+      TAG: "wiz-image-${{ github.sha }}"
+      POLICY: "Default vulnerabilities policy"
+
     defaults:
       run:
         shell: bash
 
     steps:
-      # Checkout the repository to the GitHub Actions runner
-      - name: Check out repository
+      # Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      # It's possible to skip this step if this job is scheduled after an image-build job.
-      # If that's the case, also set "Run wiz CLI docker image scan" step accordingly
-      - name: Build the Docker image
-        run: cd $SCAN_PATH && docker build . --tag $TAG # Configure to fit the params you use to build your image
+      # Build Docker image
+      - name: Build Docker image
+        run: |
+          cd $SCAN_PATH
+          docker build -t $TAG .
 
+      # Download Wiz CLI
       - name: Download Wiz CLI
-        run: curl -o wizcli https://downloads.wiz.io/v1/wizcli/latest/wizcli-linux-amd64 && chmod +x wizcli
+        run: |
+          curl -L -o wizcli https://downloads.wiz.io/v1/wizcli/latest/wizcli-linux-amd64
+          chmod +x wizcli
 
-      - name: Run wiz-cli docker image scan
+      # Authenticate Wiz CLI (IMPORTANT for v1)
+      - name: Authenticate to Wiz
         env:
           WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
           WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
-        run: ./wizcli scan container-image $TAG --policies "$POLICY"
+        run: |
+          ./wizcli auth login \
+            --client-id $WIZ_CLIENT_ID \
+            --client-secret $WIZ_CLIENT_SECRET
 
-      - name: Fetch digest of Docker image for Graph enrichment
-        run: ./wizcli tag $TAG
+      # Scan Docker image
+      - name: Scan Docker Image
+        run: |
+          ./wizcli scan container-image $TAG \
+            --policy "$POLICY" \
+            --exit-code-on-failure
+
+      # Optional: Tag image for Wiz Graph
+      - name: Tag image (Graph enrichment)
+        run: |
+          ./wizcli tag $TAG
