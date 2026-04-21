@@ -1,20 +1,21 @@
-name: wiz-cli
+name: Wiz Container Scan + SARIF
 
 on:
   push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
 
 jobs:
   wiz-scan:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write
-      packages: write
-      actions: read
-      security-events: write 
+      security-events: write
 
     env:
-      TAG: docker-tag
+      TAG: 3-tier-web-application:${{ github.sha }}
       POLICY: "Default vulnerabilities policy"
 
     steps:
@@ -32,28 +33,55 @@ jobs:
           curl -L -o wizcli https://downloads.wiz.io/v1/wizcli/latest/wizcli-linux-amd64
           chmod +x wizcli
 
+      - name: Verify wizcli
+        run: ./wizcli --version
+
       - name: Wiz help
         run: |
           ./wizcli --help
           ./wizcli scan container-image --help
 
       - name: Run Wiz Container Scan
+        id: wiz_scan
+        continue-on-error: true
         env:
           WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
           WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
         run: |
-          ./wizcli scan container-image $TAG \
+          ./wizcli scan container-image "$TAG" \
           --policies "$POLICY" \
-          --client-id $WIZ_CLIENT_ID \
-          --client-secret $WIZ_CLIENT_SECRET \
+          --client-id "$WIZ_CLIENT_ID" \
+          --client-secret "$WIZ_CLIENT_SECRET" \
           --stdout=json \
           --json-output-file=wiz.json \
           --sarif-output-file=wiz.sarif
 
           echo "===== SCAN OUTPUT ====="
-          cat wiz.json | jq
+          if [ -f wiz.json ]; then
+            cat wiz.json | jq
+          else
+            echo "wiz.json was not created by wizcli"
+          fi
 
-      - name: Upload sarif
+      - name: Verify SARIF output exists
+        if: always()
+        run: |
+          if [ ! -f wiz.sarif ]; then
+            echo "wiz.sarif was not generated; scan output cannot be uploaded to GitHub Security"
+            exit 1
+          fi
+
+      - name: Upload SARIF to GitHub Security
+        if: always()
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: wiz.sarif
+          category: wiz-container-scan
+
+      - name: Enforce Wiz policy gate
+        if: always()
+        run: |
+          if [ "${{ steps.wiz_scan.outcome }}" != "success" ]; then
+            echo "Wiz scan reported policy violations or execution failures"
+            exit 1
+          fi
