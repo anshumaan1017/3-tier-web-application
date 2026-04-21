@@ -56,12 +56,7 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          ./scripts/parse_wiz_scan.ps1 \
-            -WizJsonPath wiz.json \
-            -WizStdoutPath wiz-stdout.json \
-            -OutputSarifPath wiz-github.sarif \
-            -SummaryMarkdownPath wiz-summary.md \
-            -AppSecContact "${{ env.APPSEC_CONTACT }}"
+          ./scripts/parse_wiz_scan.ps1 -WizJsonPath wiz.json -WizStdoutPath wiz-stdout.json -OutputSarifPath wiz-github.sarif -SummaryMarkdownPath wiz-summary.md -AppSecContact "${{ env.APPSEC_CONTACT }}"
 
       - name: Verify SARIF output exists
         if: always()

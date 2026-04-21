@@ -97,6 +97,7 @@ function Process-Node {
   $pkgVersion = "-"
   if ($Node.type -and $Node.type.name) { $pkgName = [string]$Node.type.name }
   elseif ($Node.name) { $pkgName = [string]$Node.name }
+  $pkgName = $pkgName.Trim()
   if ($Node.type -and $Node.type.version) { $pkgVersion = [string]$Node.type.version }
   elseif ($Node.version) { $pkgVersion = [string]$Node.version }
 
@@ -117,7 +118,7 @@ function Process-Node {
   if ($low -eq 0) { $low = Get-NormalizedInt ($Node.severities.lowCount) }
 
   $total = $critical + $high + $medium + $low
-  if ($pkgName -and $total -gt 0) {
+  if (-not [string]::IsNullOrWhiteSpace($pkgName) -and $total -gt 0) {
     $key = "$pkgName@$pkgVersion"
     if (-not $script:Packages.ContainsKey($key)) {
       $script:Packages[$key] = [ordered]@{
