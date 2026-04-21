@@ -67,6 +67,12 @@ function Get-ShortPackage {
   return $short
 }
 
+function Get-ColorizedSeverity {
+  param([string]$Severity)
+  $color = Get-ColorCode -Severity $Severity
+  return "$([char]27)[$color`m$Severity$([char]27)[0m"
+}
+
 $script:Verdict = "UNKNOWN"
 $script:WizUrl = ""
 $script:Packages = @{}
@@ -244,6 +250,32 @@ if ($script:Verdict -notin @("PASS", "SUCCESS")) {
 
 Write-Host "===== TOP PACKAGES BY VULNERABILITY COUNT ====="
 $rows | Select-Object -First 50 package, version, critical, high, medium, low, total | Format-Table -AutoSize | Out-String | Write-Host
+
+Write-Host "===== DETAILED FINDINGS ====="
+$detailRows = $script:DetailedFindings | Sort-Object -Property total -Descending | Select-Object -First 150
+if ($detailRows.Count -eq 0) {
+  Write-Host "No detailed findings were parsed from the Wiz JSON payload."
+} else {
+  $header = @("PACKAGE", "CVE", "SEVERITY", "CRITICAL", "HIGH", "MEDIUM", "LOW", "FIX")
+  $header -join " | " | Write-Host
+  ("-" * 120) | Write-Host
+  foreach ($finding in $detailRows) {
+    $sev = Get-MaxSeverityLabel -Critical $finding.critical -High $finding.high -Medium $finding.medium -Low $finding.low
+    $sevText = Get-ColorizedSeverity -Severity $sev
+    $fix = $finding.remediation
+    if ($fix.Length -gt 120) { $fix = $fix.Substring(0, 117) + "..." }
+    @(
+      $finding.package,
+      $finding.cve,
+      $sevText,
+      $finding.critical,
+      $finding.high,
+      $finding.medium,
+      $finding.low,
+      $fix
+    ) -join " | " | Write-Host
+  }
+}
 
 if ($script:DetailedFindings.Count -eq 0) {
   foreach ($r in $rows) {
