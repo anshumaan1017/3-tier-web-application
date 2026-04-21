@@ -34,7 +34,9 @@ jobs:
           chmod +x wizcli
 
       - name: Verify wizcli
-        run: ./wizcli --version
+        run: |
+          ./wizcli --help > /dev/null
+          ./wizcli scan container-image --help > /dev/null
 
       - name: Wiz help
         run: |
