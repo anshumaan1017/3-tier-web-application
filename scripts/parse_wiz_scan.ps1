@@ -73,6 +73,76 @@ function Get-ColorizedSeverity {
   return "$([char]27)[$color`m$Severity$([char]27)[0m"
 }
 
+function Get-UpgradeGuidance {
+  param(
+    [string]$CurrentVersion,
+    [string]$FixedVersion,
+    [string]$Remediation
+  )
+
+  $current = if ([string]::IsNullOrWhiteSpace($CurrentVersion)) { "unknown-current-version" } else { $CurrentVersion }
+  $fixed = if ([string]::IsNullOrWhiteSpace($FixedVersion)) { "unknown-fixed-version" } else { $FixedVersion }
+  if ($fixed -eq "unknown-fixed-version") {
+    return "Current version: $current. Fixed version: unknown. $Remediation"
+  }
+
+  return "Upgrade from $current to $fixed. $Remediation"
+}
+
+function Find-PropertyValueRecursive {
+  param(
+    $Node,
+    [string[]]$PropertyNames,
+    [System.Collections.Generic.HashSet[string]]$Visited
+  )
+
+  if ($null -eq $Node) { return $null }
+  if ($Node -is [string]) {
+    if (-not [string]::IsNullOrWhiteSpace($Node)) { return [string]$Node }
+    return $null
+  }
+  if ($Node -is [int] -or $Node -is [double] -or $Node -is [bool]) { return $null }
+
+  $identity = [System.Runtime.CompilerServices.RuntimeHelpers]::GetHashCode($Node).ToString()
+  if (-not $Visited.Add($identity)) { return $null }
+
+  if ($Node.PSObject -and $Node.PSObject.Properties) {
+    foreach ($name in $PropertyNames) {
+      $prop = $Node.PSObject.Properties[$name]
+      if (-not $prop) { continue }
+
+      $value = $prop.Value
+      if ($null -eq $value) { continue }
+      if ($value -is [string] -and -not [string]::IsNullOrWhiteSpace($value)) { return [string]$value }
+      if ($value -is [System.Collections.IEnumerable] -and -not ($value -is [string])) {
+        foreach ($item in $value) {
+          if ($item -is [string] -and -not [string]::IsNullOrWhiteSpace($item)) { return [string]$item }
+          $found = Find-PropertyValueRecursive -Node $item -PropertyNames $PropertyNames -Visited $Visited
+          if ($found) { return $found }
+        }
+      }
+    }
+
+    foreach ($prop in $Node.PSObject.Properties) {
+      $value = $prop.Value
+      if ($null -eq $value) { continue }
+      if ($value -is [string] -and -not [string]::IsNullOrWhiteSpace($value)) { continue }
+      if ($value -is [int] -or $value -is [double] -or $value -is [bool]) { continue }
+      $found = Find-PropertyValueRecursive -Node $value -PropertyNames $PropertyNames -Visited $Visited
+      if ($found) { return $found }
+    }
+  }
+
+  if ($Node -is [System.Collections.IEnumerable] -and -not ($Node -is [string])) {
+    foreach ($item in $Node) {
+      $found = Find-PropertyValueRecursive -Node $item -PropertyNames $PropertyNames -Visited $Visited
+      if ($found) { return $found }
+    }
+  }
+
+  return $null
+}
+
 $script:Verdict = "UNKNOWN"
 $script:WizUrl = ""
 $script:Packages = @{}
@@ -155,6 +225,16 @@ function Process-Node {
         $cve = [string]$finding.id
       }
 
+      if ($cve -eq "UNKNOWN-CVE") {
+        $foundCve = Find-PropertyValueRecursive -Node $finding -PropertyNames @("cve", "cves", "cveId", "cveID", "vulnerabilityId", "vulnerabilityID", "id") -Visited ([System.Collections.Generic.HashSet[string]]::new())
+        if ($foundCve -and [string]$foundCve -match "^CVE-\d{4}-\d+") { $cve = [string]$foundCve }
+      }
+
+      $currentVersion = Find-PropertyValueRecursive -Node $finding -PropertyNames @("currentVersion", "installedVersion", "packageVersion", "version", "current", "installed") -Visited ([System.Collections.Generic.HashSet[string]]::new())
+      if (-not $currentVersion) { $currentVersion = $pkgVersion }
+      $fixedVersion = Find-PropertyValueRecursive -Node $finding -PropertyNames @("fixedVersion", "fixedVersions", "patchedVersion", "upgradeVersion", "safeVersion", "recommendedVersion", "remediationVersion") -Visited ([System.Collections.Generic.HashSet[string]]::new())
+      if (-not $fixedVersion) { $fixedVersion = "unknown-fixed-version" }
+
       $fCritical = Get-NormalizedInt ($finding.severities.criticalCount)
       if ($fCritical -eq 0) { $fCritical = Get-NormalizedInt ($finding.criticalCount) }
       $fHigh = Get-NormalizedInt ($finding.severities.highCount)
@@ -181,6 +261,8 @@ function Process-Node {
       $script:DetailedFindings.Add([ordered]@{
         package = $(if ($pkgName) { $pkgName } else { "unknown-package" })
         version = $pkgVersion
+        currentVersion = $currentVersion
+        fixedVersion = $fixedVersion
         cve = $cve
         critical = $fCritical
         high = $fHigh
@@ -256,23 +338,28 @@ $detailRows = $script:DetailedFindings | Sort-Object -Property total -Descending
 if ($detailRows.Count -eq 0) {
   Write-Host "No detailed findings were parsed from the Wiz JSON payload."
 } else {
-  $header = @("PACKAGE", "CVE", "SEVERITY", "CRITICAL", "HIGH", "MEDIUM", "LOW", "FIX")
+  $header = @("PACKAGE", "CVE", "SEVERITY", "CURRENT VERSION", "FIXED VERSION", "CRITICAL", "HIGH", "MEDIUM", "LOW", "FIX")
   $header -join " | " | Write-Host
-  ("-" * 120) | Write-Host
+  ("-" * 170) | Write-Host
   foreach ($finding in $detailRows) {
     $sev = Get-MaxSeverityLabel -Critical $finding.critical -High $finding.high -Medium $finding.medium -Low $finding.low
     $sevText = Get-ColorizedSeverity -Severity $sev
     $fix = $finding.remediation
     if ($fix.Length -gt 120) { $fix = $fix.Substring(0, 117) + "..." }
+    $current = if ($finding.currentVersion) { $finding.currentVersion } else { $finding.version }
+    $fixed = if ($finding.fixedVersion) { $finding.fixedVersion } else { "unknown-fixed-version" }
+    $guidance = Get-UpgradeGuidance -CurrentVersion $current -FixedVersion $fixed -Remediation $fix
     @(
       $finding.package,
       $finding.cve,
       $sevText,
+      $current,
+      $fixed,
       $finding.critical,
       $finding.high,
       $finding.medium,
       $finding.low,
-      $fix
+      $guidance
     ) -join " | " | Write-Host
   }
 }
@@ -282,6 +369,8 @@ if ($script:DetailedFindings.Count -eq 0) {
     $script:DetailedFindings.Add([ordered]@{
       package = $r.package
       version = $r.version
+      currentVersion = $r.version
+      fixedVersion = "unknown-fixed-version"
       cve = "UNKNOWN-CVE"
       critical = $r.critical
       high = $r.high
@@ -302,6 +391,9 @@ foreach ($f in $script:DetailedFindings) {
   $level = Get-SarifLevel -Severity $sev
   $pkgShort = Get-ShortPackage -Name $f.package
   $cve = if ($f.cve) { [string]$f.cve } else { "UNKNOWN-CVE" }
+  $currentVersion = if ($f.currentVersion) { [string]$f.currentVersion } else { [string]$f.version }
+  $fixedVersion = if ($f.fixedVersion) { [string]$f.fixedVersion } else { "unknown-fixed-version" }
+  $upgradeGuidance = Get-UpgradeGuidance -CurrentVersion $currentVersion -FixedVersion $fixedVersion -Remediation $f.remediation
   $subject = "[Wiz-Cloud-Scan] $cve $pkgShort"
   $ruleId = if ($cve -match "^CVE-\d{4}-\d+$") { $cve } else { "WIZ-OS-PACKAGE-VULNS" }
 
@@ -309,17 +401,19 @@ foreach ($f in $script:DetailedFindings) {
     $rules[$ruleId] = [ordered]@{
       id = $ruleId
       shortDescription = @{ text = $subject }
-      fullDescription = @{ text = "Container vulnerability detected by Wiz for package $($f.package)@$($f.version)." }
+      fullDescription = @{ text = "Container vulnerability detected by Wiz for package $($f.package). Current version: $currentVersion. Fixed version: $fixedVersion." }
       defaultConfiguration = @{ level = $level }
-      help = @{ text = "Fix guidance: $($f.remediation)`n$AppSecContact" }
+      help = @{ text = "Current version: $currentVersion`nFixed version: $fixedVersion`nFix guidance: $upgradeGuidance`n$AppSecContact" }
     }
   }
 
   $msg = @(
     $subject,
     "Package: $($f.package)@$($f.version)",
+    "Current version: $currentVersion",
+    "Fixed version: $fixedVersion",
     "Severity counts: critical=$($f.critical), high=$($f.high), medium=$($f.medium), low=$($f.low)",
-    "Fix guidance: $($f.remediation)",
+    "Fix guidance: $upgradeGuidance",
     "Wiz verdict: $($script:Verdict)",
     $AppSecContact
   )
@@ -342,6 +436,9 @@ foreach ($f in $script:DetailedFindings) {
       subject = $subject
       package = $f.package
       packageVersion = $f.version
+      currentVersion = $currentVersion
+      fixedVersion = $fixedVersion
+      upgradeGuidance = $upgradeGuidance
       cve = $cve
       severity = $sev
     }
@@ -360,7 +457,7 @@ if ($results.Count -eq 0 -and $script:Verdict -notin @("PASS", "SUCCESS")) {
   $results.Add([ordered]@{
     ruleId = "WIZ-POLICY-VERDICT"
     level = "warning"
-    message = @{ text = "$subject`nVerdict: $($script:Verdict)`n$AppSecContact" }
+    message = @{ text = "$subject`nVerdict: $($script:Verdict)`nCurrent version: unknown`nFixed version: unknown-fixed-version`n$AppSecContact" }
     locations = @(@{ physicalLocation = @{ artifactLocation = @{ uri = "Dockerfile" }; region = @{ startLine = 1 } } })
     partialFingerprints = @{ policy = $script:Verdict }
   })
@@ -400,10 +497,10 @@ $md += "- Contact: $AppSecContact"
 $md += ""
 $md += "## Top Packages"
 $md += ""
-$md += "| Package | Version | Critical | High | Medium | Low | Total |"
-$md += "|---|---:|---:|---:|---:|---:|---:|"
+$md += "| Package | Current Version | Fixed Version | Critical | High | Medium | Low | Total |"
+$md += "|---|---:|---:|---:|---:|---:|---:|---:|"
 foreach ($r in ($rows | Select-Object -First 100)) {
-  $md += "| $($r.package) | $($r.version) | $($r.critical) | $($r.high) | $($r.medium) | $($r.low) | $($r.total) |"
+  $md += "| $($r.package) | $($r.version) | unknown-fixed-version | $($r.critical) | $($r.high) | $($r.medium) | $($r.low) | $($r.total) |"
 }
 $md += ""
 $md += "## Parsed Finding Count"

@@ -66,19 +66,6 @@ jobs:
             exit 1
           fi
 
-      - name: Upload scan artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: wiz-scan-outputs
-          path: |
-            wiz.json
-            wiz-stdout.json
-            wiz.sarif
-            wiz-github.sarif
-            wiz-summary.md
-          if-no-files-found: warn
-
       - name: Upload SARIF to GitHub Security
         if: always()
         uses: github/codeql-action/upload-sarif@v4
