@@ -8,6 +8,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+if ([string]::IsNullOrWhiteSpace($AppSecContact)) {
+  $AppSecContact = "Emergency: contact AppSec Team at appsec@company.com or #appsec-oncall"
+}
+
 function Get-JsonObject {
   param([string]$Path)
   if (-not (Test-Path -LiteralPath $Path)) { return $null }
@@ -68,17 +72,16 @@ $script:WizUrl = ""
 $script:Packages = @{}
 $script:DetailedFindings = [System.Collections.Generic.List[object]]::new()
 
-function Visit-Node {
+function Process-Node {
   param($Node)
 
-  if ($null -eq $Node) { return }
+  if ($null -eq $Node) { return @() }
 
   if ($Node -is [System.Collections.IEnumerable] -and -not ($Node -is [string]) -and -not ($Node.PSObject -and $Node.PSObject.Properties)) {
-    foreach ($item in $Node) { Visit-Node -Node $item }
-    return
+    return @($Node)
   }
 
-  if (-not ($Node.PSObject -and $Node.PSObject.Properties)) { return }
+  if (-not ($Node.PSObject -and $Node.PSObject.Properties)) { return @() }
 
   if ($script:Verdict -eq "UNKNOWN" -and $Node.status -and $Node.status.verdict) {
     $script:Verdict = [string]$Node.status.verdict
@@ -182,11 +185,14 @@ function Visit-Node {
     }
   }
 
+  $children = @()
   foreach ($prop in $Node.PSObject.Properties) {
     $val = $prop.Value
     if ($val -is [string] -or $val -is [int] -or $val -is [double] -or $val -is [bool] -or $null -eq $val) { continue }
-    Visit-Node -Node $val
+    $children += $val
   }
+
+  return $children
 }
 
 $inputs = @()
@@ -199,7 +205,17 @@ if ($inputs.Count -eq 0) {
   throw "No parseable Wiz JSON inputs found at $WizJsonPath or $WizStdoutPath"
 }
 
-foreach ($obj in $inputs) { Visit-Node -Node $obj }
+foreach ($obj in $inputs) {
+  $stack = [System.Collections.Stack]::new()
+  $stack.Push($obj)
+  while ($stack.Count -gt 0) {
+    $node = $stack.Pop()
+    $children = Process-Node -Node $node
+    foreach ($child in $children) {
+      if ($null -ne $child) { $stack.Push($child) }
+    }
+  }
+}
 
 $rows = $script:Packages.Values | Sort-Object -Property total -Descending
 $totals = [ordered]@{ critical = 0; high = 0; medium = 0; low = 0 }
