@@ -66,42 +66,43 @@ jobs:
             exit 1
           fi
 
-          echo "===== WIZ SCAN SUMMARY ====="
+          echo "===== WIZ RAW COUNTS ====="
           jq -r '
-            def sumCounts(items):
-              reduce items[] as $item ({critical:0, high:0, medium:0, low:0}; {
-                critical: .critical + ($item.critical // 0),
-                high: .high + ($item.high // 0),
-                medium: .medium + ($item.medium // 0),
-                low: .low + ($item.low // 0)
-              });
-
-            def sevObjects:
+            def pkgRows:
               [
                 .. | objects
-                | select(has("criticalCount") or has("highCount") or has("mediumCount") or has("lowCount"))
-                | {
-                    critical: (.criticalCount // 0),
-                    high: (.highCount // 0),
-                    medium: (.mediumCount // 0),
-                    low: (.lowCount // 0)
-                  }
+                | select((.type?.name? != null) and (.vulnerabilityFindings?.severities? != null))
               ];
+            (pkgRows) as $rows
+            | {
+                packages: ($rows | length),
+                critical: ($rows | map(.vulnerabilityFindings.severities.criticalCount // 0) | add // 0),
+                high: ($rows | map(.vulnerabilityFindings.severities.highCount // 0) | add // 0),
+                medium: ($rows | map(.vulnerabilityFindings.severities.mediumCount // 0) | add // 0),
+                low: ($rows | map(.vulnerabilityFindings.severities.lowCount // 0) | add // 0)
+              }
+          ' wiz.json
 
-            def packageRows:
+          echo "===== WIZ SCAN SUMMARY ====="
+          jq -r '
+            def pkgRows:
               [
-                (.result.vulnerabilitiesByNameVersion // [])[]
+                .. | objects
+                | select((.type?.name? != null) and (.vulnerabilityFindings?.severities? != null))
                 | {
-                    name: (.type.name // "unknown"),
-                    version: (.type.version // "-"),
-                    critical: (.criticalCount // 0),
-                    high: (.highCount // 0),
-                    medium: (.mediumCount // 0),
-                    low: (.lowCount // 0)
+                    critical: (.vulnerabilityFindings.severities.criticalCount // 0),
+                    high: (.vulnerabilityFindings.severities.highCount // 0),
+                    medium: (.vulnerabilityFindings.severities.mediumCount // 0),
+                    low: (.vulnerabilityFindings.severities.lowCount // 0)
                   }
               ];
-
-            (sumCounts(sevObjects)) as $totals
+            (pkgRows) as $rows
+            | {
+                critical: ($rows | map(.critical) | add // 0),
+                high: ($rows | map(.high) | add // 0),
+                medium: ($rows | map(.medium) | add // 0),
+                low: ($rows | map(.low) | add // 0)
+              } as $totals
             | ["VERDICT", "CRITICAL", "HIGH", "MEDIUM", "LOW"],
               [(.status.verdict // "UNKNOWN"), ($totals.critical|tostring), ($totals.high|tostring), ($totals.medium|tostring), ($totals.low|tostring)]
             | @tsv
@@ -110,22 +111,22 @@ jobs:
           echo
           echo "===== TOP PACKAGES BY VULNERABILITY COUNT ====="
           jq -r '
-            def ccount: (.criticalCount // .vulnerabilityFindings.severities.criticalCount // 0);
-            def hcount: (.highCount // .vulnerabilityFindings.severities.highCount // 0);
-            def mcount: (.mediumCount // .vulnerabilityFindings.severities.mediumCount // 0);
-            def lcount: (.lowCount // .vulnerabilityFindings.severities.lowCount // 0);
-
             [
-              (.result.vulnerabilitiesByNameVersion // [])[]
+              .. | objects
+              | select((.type?.name? != null) and (.vulnerabilityFindings?.severities? != null))
               | {
                   package: (.type.name // "unknown"),
                   version: (.type.version // "-"),
-                  critical: ccount,
-                  high: hcount,
-                  medium: mcount,
-                  low: lcount,
-                  total: (ccount + hcount + mcount + lcount)
+                  critical: (.vulnerabilityFindings.severities.criticalCount // 0),
+                  high: (.vulnerabilityFindings.severities.highCount // 0),
+                  medium: (.vulnerabilityFindings.severities.mediumCount // 0),
+                  low: (.vulnerabilityFindings.severities.lowCount // 0),
+                  total: ((.vulnerabilityFindings.severities.criticalCount // 0)
+                        + (.vulnerabilityFindings.severities.highCount // 0)
+                        + (.vulnerabilityFindings.severities.mediumCount // 0)
+                        + (.vulnerabilityFindings.severities.lowCount // 0))
                 }
+              | select(.total > 0)
             ]
             | sort_by(.total) | reverse | .[:20]
             | (["PACKAGE", "VERSION", "CRITICAL", "HIGH", "MEDIUM", "LOW", "TOTAL"] | @tsv),
@@ -144,9 +145,25 @@ jobs:
           }
 
           const data = JSON.parse(fs.readFileSync("wiz.json", "utf8"));
-          const rows = Array.isArray(data?.result?.vulnerabilitiesByNameVersion)
-            ? data.result.vulnerabilitiesByNameVersion
-            : [];
+          const rows = [];
+          const visit = (node) => {
+            if (!node || typeof node !== "object") return;
+            if (
+              node.type &&
+              typeof node.type === "object" &&
+              node.type.name &&
+              node.vulnerabilityFindings &&
+              node.vulnerabilityFindings.severities
+            ) {
+              rows.push(node);
+            }
+            if (Array.isArray(node)) {
+              for (const item of node) visit(item);
+            } else {
+              for (const value of Object.values(node)) visit(value);
+            }
+          };
+          visit(data);
 
           const normalize = (n) => Number.isFinite(Number(n)) ? Number(n) : 0;
           const countFor = (row, sev) => {
