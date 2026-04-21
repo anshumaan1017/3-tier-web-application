@@ -56,132 +56,119 @@ jobs:
           --client-secret "$WIZ_CLIENT_SECRET" \
           --stdout=json \
           --json-output-file=wiz.json \
-          --sarif-output-file=wiz.sarif
+          --sarif-output-file=wiz.sarif \
+          > wiz-stdout.json
 
-      - name: Print Wiz scan summary table
-        if: always()
-        run: |
-          if [ ! -f wiz.json ]; then
-            echo "wiz.json was not created by wizcli"
-            exit 1
-          fi
-
-          echo "===== WIZ RAW COUNTS ====="
-          jq -r '
-            def pkgRows:
-              [
-                .. | objects
-                | select((.type?.name? != null) and (.vulnerabilityFindings?.severities? != null))
-              ];
-            (pkgRows) as $rows
-            | {
-                packages: ($rows | length),
-                critical: ($rows | map(.vulnerabilityFindings.severities.criticalCount // 0) | add // 0),
-                high: ($rows | map(.vulnerabilityFindings.severities.highCount // 0) | add // 0),
-                medium: ($rows | map(.vulnerabilityFindings.severities.mediumCount // 0) | add // 0),
-                low: ($rows | map(.vulnerabilityFindings.severities.lowCount // 0) | add // 0)
-              }
-          ' wiz.json
-
-          echo "===== WIZ SCAN SUMMARY ====="
-          jq -r '
-            def pkgRows:
-              [
-                .. | objects
-                | select((.type?.name? != null) and (.vulnerabilityFindings?.severities? != null))
-                | {
-                    critical: (.vulnerabilityFindings.severities.criticalCount // 0),
-                    high: (.vulnerabilityFindings.severities.highCount // 0),
-                    medium: (.vulnerabilityFindings.severities.mediumCount // 0),
-                    low: (.vulnerabilityFindings.severities.lowCount // 0)
-                  }
-              ];
-            (pkgRows) as $rows
-            | {
-                critical: ($rows | map(.critical) | add // 0),
-                high: ($rows | map(.high) | add // 0),
-                medium: ($rows | map(.medium) | add // 0),
-                low: ($rows | map(.low) | add // 0)
-              } as $totals
-            | ["VERDICT", "CRITICAL", "HIGH", "MEDIUM", "LOW"],
-              [(.status.verdict // "UNKNOWN"), ($totals.critical|tostring), ($totals.high|tostring), ($totals.medium|tostring), ($totals.low|tostring)]
-            | @tsv
-          ' wiz.json | column -t -s $'\t'
-
-          echo
-          echo "===== TOP PACKAGES BY VULNERABILITY COUNT ====="
-          jq -r '
-            [
-              .. | objects
-              | select((.type?.name? != null) and (.vulnerabilityFindings?.severities? != null))
-              | {
-                  package: (.type.name // "unknown"),
-                  version: (.type.version // "-"),
-                  critical: (.vulnerabilityFindings.severities.criticalCount // 0),
-                  high: (.vulnerabilityFindings.severities.highCount // 0),
-                  medium: (.vulnerabilityFindings.severities.mediumCount // 0),
-                  low: (.vulnerabilityFindings.severities.lowCount // 0),
-                  total: ((.vulnerabilityFindings.severities.criticalCount // 0)
-                        + (.vulnerabilityFindings.severities.highCount // 0)
-                        + (.vulnerabilityFindings.severities.mediumCount // 0)
-                        + (.vulnerabilityFindings.severities.lowCount // 0))
-                }
-              | select(.total > 0)
-            ]
-            | sort_by(.total) | reverse | .[:20]
-            | (["PACKAGE", "VERSION", "CRITICAL", "HIGH", "MEDIUM", "LOW", "TOTAL"] | @tsv),
-              (.[] | [.package, .version, (.critical|tostring), (.high|tostring), (.medium|tostring), (.low|tostring), (.total|tostring)] | @tsv)
-          ' wiz.json | column -t -s $'\t'
-
-      - name: Build GitHub-friendly SARIF from Wiz JSON
+      - name: Build table output and GitHub SARIF
         if: always()
         run: |
           node <<'EOF'
           const fs = require("fs");
 
-          if (!fs.existsSync("wiz.json")) {
-            console.error("wiz.json is missing");
+          const files = ["wiz.json", "wiz-stdout.json"].filter((p) => fs.existsSync(p));
+          if (files.length === 0) {
+            console.error("No Wiz JSON outputs found");
             process.exit(1);
           }
 
-          const data = JSON.parse(fs.readFileSync("wiz.json", "utf8"));
-          const rows = [];
+          const normalize = (n) => Number.isFinite(Number(n)) ? Number(n) : 0;
+          const countFor = (node, sev) => {
+            const key = `${sev}Count`;
+            return normalize(
+              node?.[key] ??
+              node?.vulnerabilityFindings?.severities?.[key] ??
+              node?.severities?.[key] ??
+              0
+            );
+          };
+
+          const packageMap = new Map();
+          let verdict = "UNKNOWN";
+
           const visit = (node) => {
             if (!node || typeof node !== "object") return;
-            if (
-              node.type &&
-              typeof node.type === "object" &&
-              node.type.name &&
-              node.vulnerabilityFindings &&
-              node.vulnerabilityFindings.severities
-            ) {
-              rows.push(node);
+
+            if (typeof node?.status?.verdict === "string" && verdict === "UNKNOWN") {
+              verdict = node.status.verdict;
             }
+
+            const name = node?.type?.name || node?.name;
+            const version = node?.type?.version || node?.version || "-";
+            const critical = countFor(node, "critical");
+            const high = countFor(node, "high");
+            const medium = countFor(node, "medium");
+            const low = countFor(node, "low");
+            const total = critical + high + medium + low;
+
+            if (name && total > 0) {
+              const key = `${name}@${version}`;
+              const current = packageMap.get(key) || { package: name, version, critical: 0, high: 0, medium: 0, low: 0, total: 0 };
+              current.critical += critical;
+              current.high += high;
+              current.medium += medium;
+              current.low += low;
+              current.total += total;
+              packageMap.set(key, current);
+            }
+
             if (Array.isArray(node)) {
               for (const item of node) visit(item);
             } else {
               for (const value of Object.values(node)) visit(value);
             }
           };
-          visit(data);
 
-          const normalize = (n) => Number.isFinite(Number(n)) ? Number(n) : 0;
-          const countFor = (row, sev) => {
-            const directKey = `${sev}Count`;
-            const nested = row?.vulnerabilityFindings?.severities?.[directKey];
-            const direct = row?.[directKey];
-            return normalize(direct ?? nested ?? 0);
-          };
+          for (const file of files) {
+            try {
+              visit(JSON.parse(fs.readFileSync(file, "utf8")));
+            } catch {
+              // Ignore malformed/empty JSON capture files.
+            }
+          }
+
+          const rows = Array.from(packageMap.values()).sort((a, b) => b.total - a.total);
+          const totals = rows.reduce(
+            (acc, r) => ({
+              critical: acc.critical + r.critical,
+              high: acc.high + r.high,
+              medium: acc.medium + r.medium,
+              low: acc.low + r.low,
+            }),
+            { critical: 0, high: 0, medium: 0, low: 0 }
+          );
+
+          console.log("===== WIZ SCAN SUMMARY =====");
+          console.table([
+            {
+              VERDICT: verdict,
+              CRITICAL: totals.critical,
+              HIGH: totals.high,
+              MEDIUM: totals.medium,
+              LOW: totals.low,
+            },
+          ]);
+
+          console.log("===== TOP PACKAGES BY VULNERABILITY COUNT =====");
+          console.table(rows.slice(0, 20).map((r) => ({
+            PACKAGE: r.package,
+            VERSION: r.version,
+            CRITICAL: r.critical,
+            HIGH: r.high,
+            MEDIUM: r.medium,
+            LOW: r.low,
+            TOTAL: r.total,
+          })));
+
           const results = [];
 
           for (const row of rows) {
-            const pkg = row?.type?.name || "unknown-package";
-            const ver = row?.type?.version || "unknown-version";
-            const critical = countFor(row, "critical");
-            const high = countFor(row, "high");
-            const medium = countFor(row, "medium");
-            const low = countFor(row, "low");
-            const total = critical + high + medium + low;
+            const pkg = row.package || "unknown-package";
+            const ver = row.version || "unknown-version";
+            const critical = normalize(row.critical);
+            const high = normalize(row.high);
+            const medium = normalize(row.medium);
+            const low = normalize(row.low);
+            const total = normalize(row.total);
             if (total === 0) continue;
 
             let level = "note";
@@ -209,6 +196,28 @@ jobs:
             });
           }
 
+          if (results.length === 0 && verdict !== "PASS" && verdict !== "SUCCESS") {
+            const level = verdict === "BLOCK_BY_POLICY" ? "error" : "warning";
+            results.push({
+              ruleId: "WIZ-POLICY-VERDICT",
+              level,
+              message: {
+                text: `Wiz policy verdict is ${verdict}. Package-level counts were not present in Wiz JSON output, but policy indicates findings.`
+              },
+              locations: [
+                {
+                  physicalLocation: {
+                    artifactLocation: { uri: "Dockerfile" },
+                    region: { startLine: 1 }
+                  }
+                }
+              ],
+              partialFingerprints: {
+                policyVerdict: verdict
+              }
+            });
+          }
+
           const sarif = {
             version: "2.1.0",
             $schema: "https://json.schemastore.org/sarif-2.1.0.json",
@@ -219,6 +228,18 @@ jobs:
                     name: "WizCLI",
                     informationUri: "https://www.wiz.io/",
                     rules: [
+                      {
+                        id: "WIZ-POLICY-VERDICT",
+                        shortDescription: {
+                          text: "Wiz policy verdict indicates security findings"
+                        },
+                        fullDescription: {
+                          text: "Wiz policy verdict reported findings, even when package-level counts were not available in JSON output."
+                        },
+                        defaultConfiguration: {
+                          level: "warning"
+                        }
+                      },
                       {
                         id: "WIZ-OS-PACKAGE-VULNS",
                         shortDescription: {
