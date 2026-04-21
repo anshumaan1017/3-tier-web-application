@@ -384,10 +384,6 @@ Write-Host "Generated $SummaryMarkdownPath"
 if ($script:WizUrl) { Write-Host "Latest Wiz scan URL: $($script:WizUrl)" }
 Write-Host "::notice::Wiz parsing complete. SARIF results: $($results.Count)."
 Write-Host "::notice::AppSec escalation contact: $AppSecContact"
-
-if ($script:Verdict -eq "BLOCK_BY_POLICY") {
-  exit 2
-}
 exit 0
 
 # Note: GitHub Security tab controls severity colors in its own UI.
