@@ -17,14 +17,12 @@ jobs:
     env:
       TAG: 3-tier-web-application:${{ github.sha }}
       POLICY: "Default vulnerabilities policy"
+      APPSEC_CONTACT: ${{ vars.APPSEC_CONTACT }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         
-      - name: Install jq
-        uses: dcarbone/install-jq-action@v3.2.0
-
       - name: Build image
         run: docker build . -t $TAG
 
@@ -37,11 +35,6 @@ jobs:
         run: |
           ./wizcli --help > /dev/null
           ./wizcli scan container-image --help > /dev/null
-
-      - name: Wiz help
-        run: |
-          ./wizcli --help
-          ./wizcli scan container-image --help
 
       - name: Run Wiz Container Scan
         id: wiz_scan
@@ -59,225 +52,41 @@ jobs:
           --sarif-output-file=wiz.sarif \
           > wiz-stdout.json
 
-      - name: Build table output and GitHub SARIF
+      - name: Parse Wiz output and build rich SARIF
         if: always()
+        shell: pwsh
         run: |
-          node <<'EOF'
-          const fs = require("fs");
-
-          const files = ["wiz.json", "wiz-stdout.json"].filter((p) => fs.existsSync(p));
-          if (files.length === 0) {
-            console.error("No Wiz JSON outputs found");
-            process.exit(1);
-          }
-
-          const normalize = (n) => Number.isFinite(Number(n)) ? Number(n) : 0;
-          const countFor = (node, sev) => {
-            const key = `${sev}Count`;
-            return normalize(
-              node?.[key] ??
-              node?.vulnerabilityFindings?.severities?.[key] ??
-              node?.severities?.[key] ??
-              0
-            );
-          };
-
-          const packageMap = new Map();
-          let verdict = "UNKNOWN";
-
-          const visit = (node) => {
-            if (!node || typeof node !== "object") return;
-
-            if (typeof node?.status?.verdict === "string" && verdict === "UNKNOWN") {
-              verdict = node.status.verdict;
-            }
-
-            const name = node?.type?.name || node?.name;
-            const version = node?.type?.version || node?.version || "-";
-            const critical = countFor(node, "critical");
-            const high = countFor(node, "high");
-            const medium = countFor(node, "medium");
-            const low = countFor(node, "low");
-            const total = critical + high + medium + low;
-
-            if (name && total > 0) {
-              const key = `${name}@${version}`;
-              const current = packageMap.get(key) || { package: name, version, critical: 0, high: 0, medium: 0, low: 0, total: 0 };
-              current.critical += critical;
-              current.high += high;
-              current.medium += medium;
-              current.low += low;
-              current.total += total;
-              packageMap.set(key, current);
-            }
-
-            if (Array.isArray(node)) {
-              for (const item of node) visit(item);
-            } else {
-              for (const value of Object.values(node)) visit(value);
-            }
-          };
-
-          for (const file of files) {
-            try {
-              visit(JSON.parse(fs.readFileSync(file, "utf8")));
-            } catch {
-              // Ignore malformed/empty JSON capture files.
-            }
-          }
-
-          const rows = Array.from(packageMap.values()).sort((a, b) => b.total - a.total);
-          const totals = rows.reduce(
-            (acc, r) => ({
-              critical: acc.critical + r.critical,
-              high: acc.high + r.high,
-              medium: acc.medium + r.medium,
-              low: acc.low + r.low,
-            }),
-            { critical: 0, high: 0, medium: 0, low: 0 }
-          );
-
-          console.log("===== WIZ SCAN SUMMARY =====");
-          console.table([
-            {
-              VERDICT: verdict,
-              CRITICAL: totals.critical,
-              HIGH: totals.high,
-              MEDIUM: totals.medium,
-              LOW: totals.low,
-            },
-          ]);
-
-          console.log("===== TOP PACKAGES BY VULNERABILITY COUNT =====");
-          console.table(rows.slice(0, 20).map((r) => ({
-            PACKAGE: r.package,
-            VERSION: r.version,
-            CRITICAL: r.critical,
-            HIGH: r.high,
-            MEDIUM: r.medium,
-            LOW: r.low,
-            TOTAL: r.total,
-          })));
-
-          const results = [];
-
-          for (const row of rows) {
-            const pkg = row.package || "unknown-package";
-            const ver = row.version || "unknown-version";
-            const critical = normalize(row.critical);
-            const high = normalize(row.high);
-            const medium = normalize(row.medium);
-            const low = normalize(row.low);
-            const total = normalize(row.total);
-            if (total === 0) continue;
-
-            let level = "note";
-            if (critical > 0 || high > 0) level = "error";
-            else if (medium > 0) level = "warning";
-
-            const fingerprint = `${pkg}@${ver}`;
-            results.push({
-              ruleId: "WIZ-OS-PACKAGE-VULNS",
-              level,
-              message: {
-                text: `Package ${pkg}@${ver} has vulnerabilities (critical=${critical}, high=${high}, medium=${medium}, low=${low}).`
-              },
-              locations: [
-                {
-                  physicalLocation: {
-                    artifactLocation: { uri: "Dockerfile" },
-                    region: { startLine: 1 }
-                  }
-                }
-              ],
-              partialFingerprints: {
-                packageFingerprint: fingerprint
-              }
-            });
-          }
-
-          if (results.length === 0 && verdict !== "PASS" && verdict !== "SUCCESS") {
-            const level = verdict === "BLOCK_BY_POLICY" ? "error" : "warning";
-            results.push({
-              ruleId: "WIZ-POLICY-VERDICT",
-              level,
-              message: {
-                text: `Wiz policy verdict is ${verdict}. Package-level counts were not present in Wiz JSON output, but policy indicates findings.`
-              },
-              locations: [
-                {
-                  physicalLocation: {
-                    artifactLocation: { uri: "Dockerfile" },
-                    region: { startLine: 1 }
-                  }
-                }
-              ],
-              partialFingerprints: {
-                policyVerdict: verdict
-              }
-            });
-          }
-
-          const sarif = {
-            version: "2.1.0",
-            $schema: "https://json.schemastore.org/sarif-2.1.0.json",
-            runs: [
-              {
-                tool: {
-                  driver: {
-                    name: "WizCLI",
-                    informationUri: "https://www.wiz.io/",
-                    rules: [
-                      {
-                        id: "WIZ-POLICY-VERDICT",
-                        shortDescription: {
-                          text: "Wiz policy verdict indicates security findings"
-                        },
-                        fullDescription: {
-                          text: "Wiz policy verdict reported findings, even when package-level counts were not available in JSON output."
-                        },
-                        defaultConfiguration: {
-                          level: "warning"
-                        }
-                      },
-                      {
-                        id: "WIZ-OS-PACKAGE-VULNS",
-                        shortDescription: {
-                          text: "Container OS package vulnerabilities detected by Wiz"
-                        },
-                        fullDescription: {
-                          text: "Wiz container scan found package vulnerabilities and published a GitHub-compatible SARIF record."
-                        },
-                        defaultConfiguration: {
-                          level: "warning"
-                        }
-                      }
-                    ]
-                  }
-                },
-                automationDetails: {
-                  id: "wiz-container-scan"
-                },
-                results
-              }
-            ]
-          };
-
-          fs.writeFileSync("wiz-github.sarif", JSON.stringify(sarif, null, 2));
-          console.log(`Generated wiz-github.sarif with ${results.length} result(s).`);
-          EOF
+          ./scripts/parse_wiz_scan.ps1 \
+            -WizJsonPath wiz.json \
+            -WizStdoutPath wiz-stdout.json \
+            -OutputSarifPath wiz-github.sarif \
+            -SummaryMarkdownPath wiz-summary.md \
+            -AppSecContact "${{ env.APPSEC_CONTACT }}"
 
       - name: Verify SARIF output exists
         if: always()
         run: |
-          if [ ! -f wiz.sarif ] && [ ! -f wiz-github.sarif ]; then
+          if [ ! -f wiz-github.sarif ]; then
             echo "No SARIF file was generated; scan output cannot be uploaded to GitHub Security"
             exit 1
           fi
 
+      - name: Upload scan artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wiz-scan-outputs
+          path: |
+            wiz.json
+            wiz-stdout.json
+            wiz.sarif
+            wiz-github.sarif
+            wiz-summary.md
+          if-no-files-found: warn
+
       - name: Upload SARIF to GitHub Security
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: wiz-github.sarif
           category: wiz-container-scan
