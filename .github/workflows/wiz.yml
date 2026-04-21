@@ -110,16 +110,21 @@ jobs:
           echo
           echo "===== TOP PACKAGES BY VULNERABILITY COUNT ====="
           jq -r '
+            def ccount: (.criticalCount // .vulnerabilityFindings.severities.criticalCount // 0);
+            def hcount: (.highCount // .vulnerabilityFindings.severities.highCount // 0);
+            def mcount: (.mediumCount // .vulnerabilityFindings.severities.mediumCount // 0);
+            def lcount: (.lowCount // .vulnerabilityFindings.severities.lowCount // 0);
+
             [
               (.result.vulnerabilitiesByNameVersion // [])[]
               | {
                   package: (.type.name // "unknown"),
                   version: (.type.version // "-"),
-                  critical: (.criticalCount // 0),
-                  high: (.highCount // 0),
-                  medium: (.mediumCount // 0),
-                  low: (.lowCount // 0),
-                  total: ((.criticalCount // 0) + (.highCount // 0) + (.mediumCount // 0) + (.lowCount // 0))
+                  critical: ccount,
+                  high: hcount,
+                  medium: mcount,
+                  low: lcount,
+                  total: (ccount + hcount + mcount + lcount)
                 }
             ]
             | sort_by(.total) | reverse | .[:20]
@@ -144,15 +149,21 @@ jobs:
             : [];
 
           const normalize = (n) => Number.isFinite(Number(n)) ? Number(n) : 0;
+          const countFor = (row, sev) => {
+            const directKey = `${sev}Count`;
+            const nested = row?.vulnerabilityFindings?.severities?.[directKey];
+            const direct = row?.[directKey];
+            return normalize(direct ?? nested ?? 0);
+          };
           const results = [];
 
           for (const row of rows) {
             const pkg = row?.type?.name || "unknown-package";
             const ver = row?.type?.version || "unknown-version";
-            const critical = normalize(row?.criticalCount);
-            const high = normalize(row?.highCount);
-            const medium = normalize(row?.mediumCount);
-            const low = normalize(row?.lowCount);
+            const critical = countFor(row, "critical");
+            const high = countFor(row, "high");
+            const medium = countFor(row, "medium");
+            const low = countFor(row, "low");
             const total = critical + high + medium + low;
             if (total === 0) continue;
 
