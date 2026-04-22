@@ -75,6 +75,37 @@ function Get-ColorizedSeverity {
   return "$([char]27)[$color`m$Severity$([char]27)[0m"
 }
 
+function Get-StableIssueId {
+  param(
+    [string]$Primary,
+    [string]$Fallback,
+    [string]$Package,
+    [string]$Version
+  )
+
+  $normalizedPrimary = Normalize-CveIdentifier -Text $Primary
+  if ($normalizedPrimary) { return $normalizedPrimary }
+
+  $normalizedFallback = Normalize-CveIdentifier -Text $Fallback
+  if ($normalizedFallback) { return $normalizedFallback }
+
+  $p = Get-NonEmptyString $Primary ""
+  if (-not [string]::IsNullOrWhiteSpace($p)) {
+    $cleanPrimary = ($p -replace "[^a-zA-Z0-9._:-]", "-").Trim('-')
+    if (-not [string]::IsNullOrWhiteSpace($cleanPrimary)) { return $cleanPrimary }
+  }
+
+  $f = Get-NonEmptyString $Fallback ""
+  if (-not [string]::IsNullOrWhiteSpace($f)) {
+    $cleanFallback = ($f -replace "[^a-zA-Z0-9._:-]", "-").Trim('-')
+    if (-not [string]::IsNullOrWhiteSpace($cleanFallback)) { return $cleanFallback }
+  }
+
+  $pkgShort = Get-ShortPackage -Name (Get-NonEmptyString $Package "unknown-package")
+  $verShort = Get-ShortPackage -Name (Get-NonEmptyString $Version "-")
+  return "WIZ-PKG-$pkgShort-$verShort"
+}
+
 function Get-UpgradeGuidance {
   param(
     [string]$CurrentVersion,
@@ -350,6 +381,7 @@ function Process-Node {
         currentVersion = $currentVersion
         fixedVersion = $fixedVersion
         cve = $cve
+        issueId = $cve
         critical = $fCritical
         high = $fHigh
         medium = $fMedium
@@ -474,6 +506,8 @@ function Merge-DetailedFindingsFromSarif {
       currentVersion = $currentVersion
       fixedVersion = $fixedVersion
       cve = $cve
+      issueId = (Get-StableIssueId -Primary $ruleId -Fallback $cve -Package $package -Version $version)
+      sourceRuleId = $ruleId
       critical = $critical
       high = $high
       medium = $medium
@@ -522,6 +556,8 @@ if ($script:WizCloudUrl) {
   $script:WizUrl = $GitHubRunUrl
 }
 
+$rowFallbackCount = 0
+
 $rows = $script:Packages.Values |
   Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.package) -and [int]$_.total -gt 0 } |
   Sort-Object -Property total -Descending
@@ -543,6 +579,36 @@ if ($rows.Count -eq 0 -and $script:DetailedFindings.Count -gt 0) {
   }
   $rows = $agg.Values | Sort-Object -Property total -Descending
 }
+
+if ($script:DetailedFindings.Count -eq 0) {
+  foreach ($r in $rows) {
+    $pkg = Get-MapString -Obj $r -Key "package" -Default "unknown-package"
+    $ver = Get-MapString -Obj $r -Key "version" -Default "-"
+    $criticalVal = Get-MapInt -Obj $r -Key "critical"
+    $highVal = Get-MapInt -Obj $r -Key "high"
+    $mediumVal = Get-MapInt -Obj $r -Key "medium"
+    $lowVal = Get-MapInt -Obj $r -Key "low"
+    $totalVal = Get-MapInt -Obj $r -Key "total"
+    if ($totalVal -le 0) { continue }
+    $rowFallbackCount += 1
+    $fallbackIssueId = Get-StableIssueId -Primary "" -Fallback "" -Package $pkg -Version $ver
+    $script:DetailedFindings.Add([ordered]@{
+      package = $pkg
+      version = $ver
+      currentVersion = $ver
+      fixedVersion = "unknown-fixed-version"
+      cve = $fallbackIssueId
+      issueId = $fallbackIssueId
+      critical = $criticalVal
+      high = $highVal
+      medium = $mediumVal
+      low = $lowVal
+      total = $totalVal
+      remediation = "Use your package manager to upgrade this package to a fixed version."
+      referenceUrl = $(if ($script:WizUrl) { $script:WizUrl } else { "" })
+    })
+  }
+}
 $totals = [ordered]@{ critical = 0; high = 0; medium = 0; low = 0 }
 foreach ($r in $rows) {
   $totals.critical += [int]$r.critical
@@ -558,6 +624,7 @@ $summaryColor = Get-ColorCode -Severity $maxSev
 Write-Host "===== WIZ SCAN SUMMARY ====="
 Write-Host (("{0}[{1}mVERDICT: {2}  CRITICAL: {3}  HIGH: {4}  MEDIUM: {5}  LOW: {6}{0}[0m" -f $esc, $summaryColor, $script:Verdict, $totals.critical, $totals.high, $totals.medium, $totals.low))
 Write-Host "PARSER_COUNTS: json_findings=$jsonFindingCount sarif_enriched=$sarifEnrichedCount total_findings=$($script:DetailedFindings.Count)"
+Write-Host "PARSER_FALLBACK: package_rows=$($rows.Count) row_enriched_findings=$rowFallbackCount"
 
 if ($script:WizUrl) {
   Write-Host "WIZ_SCAN_URL: $($script:WizUrl)"
@@ -600,9 +667,9 @@ $detailRows = $script:DetailedFindings | Sort-Object -Property total -Descending
 if ($detailRows.Count -eq 0) {
   Write-Host "No detailed findings were parsed from the Wiz JSON payload."
 } else {
-  $header = @("PACKAGE", "CVE", "SEVERITY", "CURRENT VERSION", "FIXED VERSION", "CRITICAL", "HIGH", "MEDIUM", "LOW", "FIX")
+  $header = @("PACKAGE", "ISSUE", "SEVERITY", "CURRENT VERSION", "FIXED VERSION", "CRITICAL", "HIGH", "MEDIUM", "LOW", "REFERENCE", "FIX")
   $header -join " | " | Write-Host
-  ("-" * 170) | Write-Host
+  ("-" * 220) | Write-Host
   foreach ($finding in $detailRows) {
     $sev = Get-MaxSeverityLabel -Critical $finding.critical -High $finding.high -Medium $finding.medium -Low $finding.low
     $sevText = Get-ColorizedSeverity -Severity $sev
@@ -612,10 +679,11 @@ if ($detailRows.Count -eq 0) {
     $fixed = if ($finding.fixedVersion) { $finding.fixedVersion } else { "unknown-fixed-version" }
     $guidance = Get-UpgradeGuidance -CurrentVersion $current -FixedVersion $fixed -Remediation $fix
     $refUrl = Get-NonEmptyString $finding.referenceUrl ""
+    $issue = Get-StableIssueId -Primary (Get-NonEmptyString $finding.issueId "") -Fallback (Get-NonEmptyString $finding.cve "") -Package (Get-NonEmptyString $finding.package "unknown-package") -Version (Get-NonEmptyString $finding.version "-")
     if ($refUrl) { $guidance = "$guidance Ref: $refUrl" }
     @(
       $finding.package,
-      $finding.cve,
+      $issue,
       $sevText,
       $current,
       $fixed,
@@ -623,34 +691,9 @@ if ($detailRows.Count -eq 0) {
       $finding.high,
       $finding.medium,
       $finding.low,
+      $(if ($refUrl) { $refUrl } else { "n/a" }),
       $guidance
     ) -join " | " | Write-Host
-  }
-}
-
-if ($script:DetailedFindings.Count -eq 0) {
-  foreach ($r in $rows) {
-    $pkg = Get-MapString -Obj $r -Key "package" -Default "unknown-package"
-    $ver = Get-MapString -Obj $r -Key "version" -Default "-"
-    $criticalVal = Get-MapInt -Obj $r -Key "critical"
-    $highVal = Get-MapInt -Obj $r -Key "high"
-    $mediumVal = Get-MapInt -Obj $r -Key "medium"
-    $lowVal = Get-MapInt -Obj $r -Key "low"
-    $totalVal = Get-MapInt -Obj $r -Key "total"
-    if ($totalVal -le 0) { continue }
-    $script:DetailedFindings.Add([ordered]@{
-      package = $pkg
-      version = $ver
-      currentVersion = $ver
-      fixedVersion = "unknown-fixed-version"
-      cve = "UNKNOWN-CVE"
-      critical = $criticalVal
-      high = $highVal
-      medium = $mediumVal
-      low = $lowVal
-      total = $totalVal
-      remediation = "Use your package manager to upgrade this package to a fixed version."
-    })
   }
 }
 
@@ -662,21 +705,23 @@ foreach ($f in $script:DetailedFindings) {
   $sev = Get-MaxSeverityLabel -Critical $f.critical -High $f.high -Medium $f.medium -Low $f.low
   $level = Get-SarifLevel -Severity $sev
   $pkgShort = Get-ShortPackage -Name $f.package
-  $cve = Normalize-CveIdentifier -Text ([string]$f.cve)
-  if (-not $cve) { $cve = "UNKNOWN-CVE" }
+  $issueId = Get-StableIssueId -Primary (Get-NonEmptyString $f.issueId "") -Fallback (Get-NonEmptyString $f.cve "") -Package (Get-NonEmptyString $f.package "unknown-package") -Version (Get-NonEmptyString $f.version "-")
+  $cve = Normalize-CveIdentifier -Text $issueId
   $currentVersion = if ($f.currentVersion) { [string]$f.currentVersion } else { [string]$f.version }
   $fixedVersion = if ($f.fixedVersion) { [string]$f.fixedVersion } else { "unknown-fixed-version" }
   $upgradeGuidance = Get-UpgradeGuidance -CurrentVersion $currentVersion -FixedVersion $fixedVersion -Remediation $f.remediation
   $referenceUrl = Get-NonEmptyString $f.referenceUrl ""
   if (-not $referenceUrl) {
-    $normalizedCveForRef = Normalize-CveIdentifier -Text $cve
+    $normalizedCveForRef = Normalize-CveIdentifier -Text $issueId
     if ($normalizedCveForRef) { $referenceUrl = "https://nvd.nist.gov/vuln/detail/$normalizedCveForRef" }
+    elseif ($script:WizUrl) { $referenceUrl = $script:WizUrl }
   }
-  $subject = "[Wiz-Cloud-Scan] $cve $pkgShort"
-  $ruleId = if ($cve -ne "UNKNOWN-CVE") { $cve } else { "WIZ-OS-PACKAGE-VULNS" }
+  $subject = "[Wiz-Cloud-Scan] $issueId $pkgShort"
+  $ruleId = $issueId
 
   $helpText = "Current version: $currentVersion`nFixed version: $fixedVersion`nFix guidance: $upgradeGuidance"
   if ($referenceUrl) { $helpText += "`nReference: $referenceUrl" }
+  if ($script:WizUrl) { $helpText += "`nWiz Portal URL: $($script:WizUrl)" }
   $helpText += "`n$AppSecContact"
 
   if (-not $rules.ContainsKey($ruleId)) {
@@ -692,6 +737,7 @@ foreach ($f in $script:DetailedFindings) {
   $msg = @(
     $subject,
     "Package: $($f.package)@$($f.version)",
+    "Issue ID: $issueId",
     "Current version: $currentVersion",
     "Fixed version: $fixedVersion",
     "Severity counts: critical=$($f.critical), high=$($f.high), medium=$($f.medium), low=$($f.low)",
@@ -723,7 +769,8 @@ foreach ($f in $script:DetailedFindings) {
       fixedVersion = $fixedVersion
       upgradeGuidance = $upgradeGuidance
       referenceUrl = $referenceUrl
-      cve = $cve
+      cve = $(if ($cve) { $cve } else { "" })
+      issueId = $issueId
       severity = $sev
     }
   })

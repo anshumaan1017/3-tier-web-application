@@ -59,6 +59,20 @@ jobs:
         run: |
           ./scripts/parse_wiz_scan.ps1 -WizJsonPath wiz.json -WizStdoutPath wiz-stdout.json -WizSarifPath wiz.sarif -OutputSarifPath wiz-github.sarif -SummaryMarkdownPath wiz-summary.md -GitHubRunUrl "${{ env.GITHUB_RUN_URL }}" -AppSecContact "${{ env.APPSEC_CONTACT }}"
 
+      - name: Upload Wiz parsed outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wiz-parsed-${{ github.run_id }}
+          retention-days: 14
+          if-no-files-found: warn
+          path: |
+            wiz-summary.md
+            wiz-github.sarif
+            wiz.sarif
+            wiz.json
+            wiz-stdout.json
+
       - name: Verify SARIF output exists
         if: always()
         run: |
