@@ -89,6 +89,15 @@ function Get-UpgradeGuidance {
   return "Upgrade from $current to $fixed. $Remediation"
 }
 
+function Normalize-CveIdentifier {
+  param([string]$Text)
+  if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+
+  $m = [regex]::Match($Text.ToUpperInvariant(), "CVE-\d{4}-\d+")
+  if ($m.Success) { return $m.Value }
+  return $null
+}
+
 function Find-PropertyValueRecursive {
   param(
     $Node,
@@ -97,11 +106,7 @@ function Find-PropertyValueRecursive {
   )
 
   if ($null -eq $Node) { return $null }
-  if ($Node -is [string]) {
-    if (-not [string]::IsNullOrWhiteSpace($Node)) { return [string]$Node }
-    return $null
-  }
-  if ($Node -is [int] -or $Node -is [double] -or $Node -is [bool]) { return $null }
+  if ($Node -is [string] -or $Node -is [int] -or $Node -is [double] -or $Node -is [bool]) { return $null }
 
   $identity = [System.Runtime.CompilerServices.RuntimeHelpers]::GetHashCode($Node).ToString()
   if (-not $Visited.Add($identity)) { return $null }
@@ -117,6 +122,7 @@ function Find-PropertyValueRecursive {
       if ($value -is [System.Collections.IEnumerable] -and -not ($value -is [string])) {
         foreach ($item in $value) {
           if ($item -is [string] -and -not [string]::IsNullOrWhiteSpace($item)) { return [string]$item }
+          if ($item -is [int] -or $item -is [double] -or $item -is [bool] -or $null -eq $item) { continue }
           $found = Find-PropertyValueRecursive -Node $item -PropertyNames $PropertyNames -Visited $Visited
           if ($found) { return $found }
         }
@@ -135,6 +141,7 @@ function Find-PropertyValueRecursive {
 
   if ($Node -is [System.Collections.IEnumerable] -and -not ($Node -is [string])) {
     foreach ($item in $Node) {
+      if ($item -is [string] -or $item -is [int] -or $item -is [double] -or $item -is [bool] -or $null -eq $item) { continue }
       $found = Find-PropertyValueRecursive -Node $item -PropertyNames $PropertyNames -Visited $Visited
       if ($found) { return $found }
     }
@@ -220,14 +227,18 @@ function Process-Node {
 
       $cve = "UNKNOWN-CVE"
       if ($finding.cves -and $finding.cves.Count -gt 0 -and $finding.cves[0]) {
-        $cve = [string]$finding.cves[0]
-      } elseif ($finding.id -and [string]$finding.id -match "CVE-\d{4}-\d+") {
-        $cve = [string]$finding.id
+        $rawCve = [string]$finding.cves[0]
+        $normalized = Normalize-CveIdentifier -Text $rawCve
+        if ($normalized) { $cve = $normalized }
+      } elseif ($finding.id) {
+        $normalized = Normalize-CveIdentifier -Text ([string]$finding.id)
+        if ($normalized) { $cve = $normalized }
       }
 
       if ($cve -eq "UNKNOWN-CVE") {
         $foundCve = Find-PropertyValueRecursive -Node $finding -PropertyNames @("cve", "cves", "cveId", "cveID", "vulnerabilityId", "vulnerabilityID", "id") -Visited ([System.Collections.Generic.HashSet[string]]::new())
-        if ($foundCve -and [string]$foundCve -match "^CVE-\d{4}-\d+") { $cve = [string]$foundCve }
+        $normalized = Normalize-CveIdentifier -Text ([string]$foundCve)
+        if ($normalized) { $cve = $normalized }
       }
 
       $currentVersion = Find-PropertyValueRecursive -Node $finding -PropertyNames @("currentVersion", "installedVersion", "packageVersion", "version", "current", "installed") -Visited ([System.Collections.Generic.HashSet[string]]::new())
@@ -390,12 +401,13 @@ foreach ($f in $script:DetailedFindings) {
   $sev = Get-MaxSeverityLabel -Critical $f.critical -High $f.high -Medium $f.medium -Low $f.low
   $level = Get-SarifLevel -Severity $sev
   $pkgShort = Get-ShortPackage -Name $f.package
-  $cve = if ($f.cve) { [string]$f.cve } else { "UNKNOWN-CVE" }
+  $cve = Normalize-CveIdentifier -Text ([string]$f.cve)
+  if (-not $cve) { $cve = "UNKNOWN-CVE" }
   $currentVersion = if ($f.currentVersion) { [string]$f.currentVersion } else { [string]$f.version }
   $fixedVersion = if ($f.fixedVersion) { [string]$f.fixedVersion } else { "unknown-fixed-version" }
   $upgradeGuidance = Get-UpgradeGuidance -CurrentVersion $currentVersion -FixedVersion $fixedVersion -Remediation $f.remediation
   $subject = "[Wiz-Cloud-Scan] $cve $pkgShort"
-  $ruleId = if ($cve -match "^CVE-\d{4}-\d+$") { $cve } else { "WIZ-OS-PACKAGE-VULNS" }
+  $ruleId = if ($cve -ne "UNKNOWN-CVE") { $cve } else { "WIZ-OS-PACKAGE-VULNS" }
 
   if (-not $rules.ContainsKey($ruleId)) {
     $rules[$ruleId] = [ordered]@{
@@ -499,8 +511,21 @@ $md += "## Top Packages"
 $md += ""
 $md += "| Package | Current Version | Fixed Version | Critical | High | Medium | Low | Total |"
 $md += "|---|---:|---:|---:|---:|---:|---:|---:|"
+
+$fixedVersionByPackageKey = @{}
+foreach ($f in $script:DetailedFindings) {
+  if (-not $f.package -or -not $f.version) { continue }
+  if (-not $f.fixedVersion -or $f.fixedVersion -eq "unknown-fixed-version") { continue }
+  $fixedVersionByPackageKey["$($f.package)@$($f.version)"] = [string]$f.fixedVersion
+}
+
 foreach ($r in ($rows | Select-Object -First 100)) {
-  $md += "| $($r.package) | $($r.version) | unknown-fixed-version | $($r.critical) | $($r.high) | $($r.medium) | $($r.low) | $($r.total) |"
+  $pkgKey = "$($r.package)@$($r.version)"
+  $mdFixedVersion = "unknown-fixed-version"
+  if ($fixedVersionByPackageKey.ContainsKey($pkgKey)) {
+    $mdFixedVersion = $fixedVersionByPackageKey[$pkgKey]
+  }
+  $md += "| $($r.package) | $($r.version) | $mdFixedVersion | $($r.critical) | $($r.high) | $($r.medium) | $($r.low) | $($r.total) |"
 }
 $md += ""
 $md += "## Parsed Finding Count"
