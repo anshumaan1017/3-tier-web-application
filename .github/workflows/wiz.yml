@@ -18,6 +18,7 @@ jobs:
       TAG: 3-tier-web-application:${{ github.sha }}
       POLICY: "Default vulnerabilities policy"
       APPSEC_CONTACT: ${{ vars.APPSEC_CONTACT }}
+      GITHUB_RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
     steps:
       - name: Checkout
@@ -56,7 +57,7 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          ./scripts/parse_wiz_scan.ps1 -WizJsonPath wiz.json -WizStdoutPath wiz-stdout.json -OutputSarifPath wiz-github.sarif -SummaryMarkdownPath wiz-summary.md -AppSecContact "${{ env.APPSEC_CONTACT }}"
+          ./scripts/parse_wiz_scan.ps1 -WizJsonPath wiz.json -WizStdoutPath wiz-stdout.json -WizSarifPath wiz.sarif -OutputSarifPath wiz-github.sarif -SummaryMarkdownPath wiz-summary.md -GitHubRunUrl "${{ env.GITHUB_RUN_URL }}" -AppSecContact "${{ env.APPSEC_CONTACT }}"
 
       - name: Verify SARIF output exists
         if: always()
