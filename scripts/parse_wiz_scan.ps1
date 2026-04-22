@@ -111,8 +111,10 @@ function Get-NonEmptyString {
 function Extract-FirstUrl {
   param([string]$Text)
   if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
-  $m = [regex]::Match($Text, "https?://[^\s\]\)\"']+")
-  if ($m.Success) { return $m.Value }
+  $m = [regex]::Match($Text, "https?://\S+")
+  if ($m.Success) {
+    return ([string]$m.Value).TrimEnd(')',']','"','''',',','.')
+  }
   return $null
 }
 
