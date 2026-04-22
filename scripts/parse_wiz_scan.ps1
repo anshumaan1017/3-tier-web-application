@@ -140,6 +140,32 @@ function Parse-SeverityCountsFromText {
   return $counts
 }
 
+function Get-MapInt {
+  param($Obj, [string]$Key)
+  if ($null -eq $Obj) { return 0 }
+  if ($Obj -is [System.Collections.IDictionary]) {
+    if ($Obj.Contains($Key)) { return Get-NormalizedInt $Obj[$Key] }
+    return 0
+  }
+  if ($Obj.PSObject -and $Obj.PSObject.Properties[$Key]) {
+    return Get-NormalizedInt $Obj.$Key
+  }
+  return 0
+}
+
+function Get-MapString {
+  param($Obj, [string]$Key, [string]$Default = "")
+  if ($null -eq $Obj) { return $Default }
+  if ($Obj -is [System.Collections.IDictionary]) {
+    if ($Obj.Contains($Key)) { return Get-NonEmptyString $Obj[$Key] $Default }
+    return $Default
+  }
+  if ($Obj.PSObject -and $Obj.PSObject.Properties[$Key]) {
+    return Get-NonEmptyString $Obj.$Key $Default
+  }
+  return $Default
+}
+
 function Find-PropertyValueRecursive {
   param(
     $Node,
@@ -481,10 +507,14 @@ foreach ($obj in $inputs) {
   }
 }
 
+$jsonFindingCount = $script:DetailedFindings.Count
+
 $wizSarif = Get-JsonObject -Path $WizSarifPath
 if ($wizSarif) {
   Merge-DetailedFindingsFromSarif -SarifObject $wizSarif
 }
+$sarifEnrichedCount = $script:DetailedFindings.Count - $jsonFindingCount
+if ($sarifEnrichedCount -lt 0) { $sarifEnrichedCount = 0 }
 
 if ($script:WizCloudUrl) {
   $script:WizUrl = $script:WizCloudUrl
@@ -527,6 +557,7 @@ $summaryColor = Get-ColorCode -Severity $maxSev
 
 Write-Host "===== WIZ SCAN SUMMARY ====="
 Write-Host (("{0}[{1}mVERDICT: {2}  CRITICAL: {3}  HIGH: {4}  MEDIUM: {5}  LOW: {6}{0}[0m" -f $esc, $summaryColor, $script:Verdict, $totals.critical, $totals.high, $totals.medium, $totals.low))
+Write-Host "PARSER_COUNTS: json_findings=$jsonFindingCount sarif_enriched=$sarifEnrichedCount total_findings=$($script:DetailedFindings.Count)"
 
 if ($script:WizUrl) {
   Write-Host "WIZ_SCAN_URL: $($script:WizUrl)"
@@ -537,10 +568,31 @@ if ($script:Verdict -notin @("PASS", "SUCCESS")) {
 }
 
 Write-Host "===== TOP PACKAGES BY VULNERABILITY COUNT ====="
-if ($rows.Count -eq 0) {
+$packageRowsForDisplay = @()
+foreach ($r in $rows) {
+  $pkg = Get-MapString -Obj $r -Key "package" -Default ""
+  $ver = Get-MapString -Obj $r -Key "version" -Default "-"
+  $criticalVal = Get-MapInt -Obj $r -Key "critical"
+  $highVal = Get-MapInt -Obj $r -Key "high"
+  $mediumVal = Get-MapInt -Obj $r -Key "medium"
+  $lowVal = Get-MapInt -Obj $r -Key "low"
+  $totalVal = Get-MapInt -Obj $r -Key "total"
+  if ([string]::IsNullOrWhiteSpace($pkg) -or $totalVal -le 0) { continue }
+  $packageRowsForDisplay += [pscustomobject]@{
+    package = $pkg
+    version = $ver
+    critical = $criticalVal
+    high = $highVal
+    medium = $mediumVal
+    low = $lowVal
+    total = $totalVal
+  }
+}
+
+if ($packageRowsForDisplay.Count -eq 0) {
   Write-Host "No package breakdown found in Wiz JSON. Using rule-level fallback from SARIF results."
 } else {
-  $rows | Select-Object -First 50 package, version, critical, high, medium, low, total | Format-Table -AutoSize | Out-String | Write-Host
+  $packageRowsForDisplay | Select-Object -First 50 package, version, critical, high, medium, low, total | Format-Table -AutoSize | Out-String | Write-Host
 }
 
 Write-Host "===== DETAILED FINDINGS ====="
@@ -578,17 +630,25 @@ if ($detailRows.Count -eq 0) {
 
 if ($script:DetailedFindings.Count -eq 0) {
   foreach ($r in $rows) {
+    $pkg = Get-MapString -Obj $r -Key "package" -Default "unknown-package"
+    $ver = Get-MapString -Obj $r -Key "version" -Default "-"
+    $criticalVal = Get-MapInt -Obj $r -Key "critical"
+    $highVal = Get-MapInt -Obj $r -Key "high"
+    $mediumVal = Get-MapInt -Obj $r -Key "medium"
+    $lowVal = Get-MapInt -Obj $r -Key "low"
+    $totalVal = Get-MapInt -Obj $r -Key "total"
+    if ($totalVal -le 0) { continue }
     $script:DetailedFindings.Add([ordered]@{
-      package = $r.package
-      version = $r.version
-      currentVersion = $r.version
+      package = $pkg
+      version = $ver
+      currentVersion = $ver
       fixedVersion = "unknown-fixed-version"
       cve = "UNKNOWN-CVE"
-      critical = $r.critical
-      high = $r.high
-      medium = $r.medium
-      low = $r.low
-      total = $r.total
+      critical = $criticalVal
+      high = $highVal
+      medium = $mediumVal
+      low = $lowVal
+      total = $totalVal
       remediation = "Use your package manager to upgrade this package to a fixed version."
     })
   }
