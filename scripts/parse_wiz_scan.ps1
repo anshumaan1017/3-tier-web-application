@@ -1,813 +1,542 @@
+<#
+.SYNOPSIS
+  Parses Wiz CLI container-image scan JSON output.
+  Produces: rich colorized log table, GitHub SARIF, and Job Summary markdown.
+
+  Wiz JSON schema (from wizcli scan container-image --json-output-file):
+    .result.vulnerableSBOMArtifactsByNameVersion[]
+      .name                                  (package name)
+      .version                               (current installed version)
+      .vulnerabilityFindings
+        .fixedVersion                        (single fixed version for this package)
+        .remediation                         (e.g. "apt upgrade <pkg>")
+        .severities.criticalCount / highCount / mediumCount / lowCount
+        .findings[]                          (per-CVE details, may be null)
+          .name      (CVE ID)
+          .description
+          .link      (NVD or vendor advisory URL)
+          .severity
+          .fixedVersions[]
+    .extraInfo.buildParams.jobUrl            (GitHub Actions run URL)
+    .extraInfo.buildParams.commitUrl
+    .id                                      (Wiz scan UUID)
+    .status.verdict                          (PASS / WARN_BY_POLICY / FAIL / etc.)
+
+  Wiz portal deep-link:
+    https://app.wiz.io/findings/cicd-scans#~(cicd_scan~'<scanId>*)
+#>
 param(
-  [string]$WizJsonPath = "wiz.json",
-  [string]$WizStdoutPath = "wiz-stdout.json",
-  [string]$WizSarifPath = "wiz.sarif",
-  [string]$OutputSarifPath = "wiz-github.sarif",
+  [string]$WizJsonPath         = "wiz.json",
+  [string]$WizStdoutPath       = "wiz-stdout.json",
+  [string]$WizSarifPath        = "wiz.sarif",
+  [string]$OutputSarifPath     = "wiz-github.sarif",
   [string]$SummaryMarkdownPath = "wiz-summary.md",
-  [string]$GitHubRunUrl = "",
-  [string]$AppSecContact = "Emergency: contact AppSec Team at appsec@company.com or #appsec-oncall"
+  [string]$GitHubRunUrl        = "",
+  [string]$AppSecContact       = "Emergency: contact AppSec Team at appsec@company.com or #appsec-oncall"
 )
 
+Set-StrictMode -Off
 $ErrorActionPreference = "Stop"
 
 if ([string]::IsNullOrWhiteSpace($AppSecContact)) {
   $AppSecContact = "Emergency: contact AppSec Team at appsec@company.com or #appsec-oncall"
 }
 
-function Get-JsonObject {
-  param([string]$Path)
+# ─── helpers ────────────────────────────────────────────────────────────────
+
+function Get-JsonObject ([string]$Path) {
   if (-not (Test-Path -LiteralPath $Path)) { return $null }
-  try {
-    return (Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -Depth 100)
-  } catch {
-    return $null
-  }
+  try { return (Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -Depth 100) }
+  catch { return $null }
 }
 
-function Get-NormalizedInt {
-  param($Value)
-  if ($null -eq $Value) { return 0 }
-  try { return [int]$Value } catch { return 0 }
+function Safe-Int ($v) {
+  if ($null -eq $v) { return 0 }
+  try { return [int]$v } catch { return 0 }
 }
 
-function Get-MaxSeverityLabel {
-  param([int]$Critical, [int]$High, [int]$Medium, [int]$Low)
-  if ($Critical -gt 0) { return "CRITICAL" }
-  if ($High -gt 0) { return "HIGH" }
-  if ($Medium -gt 0) { return "MEDIUM" }
-  if ($Low -gt 0) { return "LOW" }
-  return "INFO"
-}
-
-function Get-SarifLevel {
-  param([string]$Severity)
-  switch ($Severity) {
-    "CRITICAL" { return "error" }
-    "HIGH" { return "error" }
-    "MEDIUM" { return "warning" }
-    "LOW" { return "note" }
-    default { return "note" }
-  }
-}
-
-function Get-ColorCode {
-  param([string]$Severity)
-  switch ($Severity) {
-    "CRITICAL" { return "31" }
-    "HIGH" { return "33" }
-    "MEDIUM" { return "34" }
-    "LOW" { return "37" }
-    default { return "32" }
-  }
-}
-
-function Get-ShortPackage {
-  param([string]$Name)
-  if ([string]::IsNullOrWhiteSpace($Name)) { return "unknown-pkg" }
-  $short = $Name -replace "[^a-zA-Z0-9._-]", "-"
-  if ($short.Length -gt 24) { return $short.Substring(0, 24) }
-  return $short
-}
-
-function Get-ColorizedSeverity {
-  param([string]$Severity)
-  $color = Get-ColorCode -Severity $Severity
-  return "$([char]27)[$color`m$Severity$([char]27)[0m"
-}
-
-function Get-StableIssueId {
-  param(
-    [string]$Primary,
-    [string]$Fallback,
-    [string]$Package,
-    [string]$Version
-  )
-
-  $normalizedPrimary = Normalize-CveIdentifier -Text $Primary
-  if ($normalizedPrimary) { return $normalizedPrimary }
-
-  $normalizedFallback = Normalize-CveIdentifier -Text $Fallback
-  if ($normalizedFallback) { return $normalizedFallback }
-
-  $p = Get-NonEmptyString $Primary ""
-  if (-not [string]::IsNullOrWhiteSpace($p)) {
-    $cleanPrimary = ($p -replace "[^a-zA-Z0-9._:-]", "-").Trim('-')
-    if (-not [string]::IsNullOrWhiteSpace($cleanPrimary)) { return $cleanPrimary }
-  }
-
-  $f = Get-NonEmptyString $Fallback ""
-  if (-not [string]::IsNullOrWhiteSpace($f)) {
-    $cleanFallback = ($f -replace "[^a-zA-Z0-9._:-]", "-").Trim('-')
-    if (-not [string]::IsNullOrWhiteSpace($cleanFallback)) { return $cleanFallback }
-  }
-
-  $pkgShort = Get-ShortPackage -Name (Get-NonEmptyString $Package "unknown-package")
-  $verShort = Get-ShortPackage -Name (Get-NonEmptyString $Version "-")
-  return "WIZ-PKG-$pkgShort-$verShort"
-}
-
-function Get-UpgradeGuidance {
-  param(
-    [string]$CurrentVersion,
-    [string]$FixedVersion,
-    [string]$Remediation
-  )
-
-  $current = if ([string]::IsNullOrWhiteSpace($CurrentVersion)) { "unknown-current-version" } else { $CurrentVersion }
-  $fixed = if ([string]::IsNullOrWhiteSpace($FixedVersion)) { "unknown-fixed-version" } else { $FixedVersion }
-  if ($fixed -eq "unknown-fixed-version") {
-    return "Current version: $current. Fixed version: unknown. $Remediation"
-  }
-
-  return "Upgrade from $current to $fixed. $Remediation"
-}
-
-function Normalize-CveIdentifier {
-  param([string]$Text)
-  if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
-
-  $m = [regex]::Match($Text.ToUpperInvariant(), "CVE-\d{4}-\d+")
-  if ($m.Success) { return $m.Value }
-  return $null
-}
-
-function Get-NonEmptyString {
-  param($Value, [string]$Default = "")
-  if ($null -eq $Value) { return $Default }
-  $s = [string]$Value
+function Safe-Str ($v, [string]$Default = "") {
+  if ($null -eq $v) { return $Default }
+  $s = [string]$v
   if ([string]::IsNullOrWhiteSpace($s)) { return $Default }
   return $s.Trim()
 }
 
-function Extract-FirstUrl {
-  param([string]$Text)
-  if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
-  $m = [regex]::Match($Text, "https?://\S+")
-  if ($m.Success) {
-    return ([string]$m.Value).TrimEnd(')',']','"','''',',','.')
-  }
+function Normalize-Cve ([string]$t) {
+  if ([string]::IsNullOrWhiteSpace($t)) { return $null }
+  $m = [regex]::Match($t.ToUpperInvariant(), "CVE-\d{4}-\d+")
+  if ($m.Success) { return $m.Value }
   return $null
 }
 
-function Parse-SeverityCountsFromText {
-  param([string]$Text)
-  $counts = [ordered]@{ critical = 0; high = 0; medium = 0; low = 0 }
-  if ([string]::IsNullOrWhiteSpace($Text)) { return $counts }
-
-  $patterns = @{
-    critical = "critical\s*=\s*(\d+)"
-    high = "high\s*=\s*(\d+)"
-    medium = "medium\s*=\s*(\d+)"
-    low = "low\s*=\s*(\d+)"
+function Sev-Level ([string]$s) {
+  switch ($s.ToUpper()) {
+    "CRITICAL" { return "error" }
+    "HIGH"     { return "error" }
+    "MEDIUM"   { return "warning" }
+    default    { return "note" }
   }
-
-  foreach ($k in $patterns.Keys) {
-    $m = [regex]::Match($Text.ToLowerInvariant(), $patterns[$k])
-    if ($m.Success) {
-      $counts[$k] = Get-NormalizedInt $m.Groups[1].Value
-    }
-  }
-
-  return $counts
 }
 
-function Get-MapInt {
-  param($Obj, [string]$Key)
-  if ($null -eq $Obj) { return 0 }
-  if ($Obj -is [System.Collections.IDictionary]) {
-    if ($Obj.Contains($Key)) { return Get-NormalizedInt $Obj[$Key] }
-    return 0
-  }
-  if ($Obj.PSObject -and $Obj.PSObject.Properties[$Key]) {
-    return Get-NormalizedInt $Obj.$Key
-  }
-  return 0
+function Max-Sev ([int]$c, [int]$h, [int]$m, [int]$l) {
+  if ($c -gt 0) { return "CRITICAL" }
+  if ($h -gt 0) { return "HIGH" }
+  if ($m -gt 0) { return "MEDIUM" }
+  if ($l -gt 0) { return "LOW" }
+  return "INFO"
 }
 
-function Get-MapString {
-  param($Obj, [string]$Key, [string]$Default = "")
-  if ($null -eq $Obj) { return $Default }
-  if ($Obj -is [System.Collections.IDictionary]) {
-    if ($Obj.Contains($Key)) { return Get-NonEmptyString $Obj[$Key] $Default }
-    return $Default
+function Color-Code ([string]$s) {
+  switch ($s.ToUpper()) {
+    "CRITICAL" { return "31" }
+    "HIGH"     { return "33" }
+    "MEDIUM"   { return "34" }
+    "LOW"      { return "37" }
+    default    { return "32" }
   }
-  if ($Obj.PSObject -and $Obj.PSObject.Properties[$Key]) {
-    return Get-NonEmptyString $Obj.$Key $Default
-  }
-  return $Default
 }
 
-function Find-PropertyValueRecursive {
-  param(
-    $Node,
-    [string[]]$PropertyNames,
-    [System.Collections.Generic.HashSet[string]]$Visited
-  )
+function Safe-PkgId ([string]$name, [string]$version) {
+  $n = ($name    -replace "[^a-zA-Z0-9._-]", "-").Trim("-")
+  $v = ($version -replace "[^a-zA-Z0-9._-]", "-").Trim("-")
+  if ($n.Length -gt 40) { $n = $n.Substring(0, 40) }
+  if ($v.Length -gt 30) { $v = $v.Substring(0, 30) }
+  return "WIZ-PKG-$n-$v"
+}
 
-  if ($null -eq $Node) { return $null }
-  if ($Node -is [string] -or $Node -is [int] -or $Node -is [double] -or $Node -is [bool]) { return $null }
+# ─── load JSON ───────────────────────────────────────────────────────────────
 
-  $identity = [System.Runtime.CompilerServices.RuntimeHelpers]::GetHashCode($Node).ToString()
-  if (-not $Visited.Add($identity)) { return $null }
+$wizJson = Get-JsonObject -Path $WizJsonPath
+if (-not $wizJson) { $wizJson = Get-JsonObject -Path $WizStdoutPath }
+if (-not $wizJson) {
+  throw "No parseable Wiz JSON found at '$WizJsonPath' or '$WizStdoutPath'"
+}
 
-  if ($Node.PSObject -and $Node.PSObject.Properties) {
-    foreach ($name in $PropertyNames) {
-      $prop = $Node.PSObject.Properties[$name]
-      if (-not $prop) { continue }
+# ─── extract top-level metadata ──────────────────────────────────────────────
 
-      $value = $prop.Value
-      if ($null -eq $value) { continue }
-      if ($value -is [string] -and -not [string]::IsNullOrWhiteSpace($value)) { return [string]$value }
-      if ($value -is [System.Collections.IEnumerable] -and -not ($value -is [string])) {
-        foreach ($item in $value) {
-          if ($item -is [string] -and -not [string]::IsNullOrWhiteSpace($item)) { return [string]$item }
-          if ($item -is [int] -or $item -is [double] -or $item -is [bool] -or $null -eq $item) { continue }
-          $found = Find-PropertyValueRecursive -Node $item -PropertyNames $PropertyNames -Visited $Visited
-          if ($found) { return $found }
+$scanId  = Safe-Str $wizJson.id
+$verdict = "UNKNOWN"
+if ($wizJson.status -and $wizJson.status.verdict) {
+  $verdict = Safe-Str $wizJson.status.verdict "UNKNOWN"
+}
+
+# Wiz portal deep-link from scan ID
+$wizPortalUrl = ""
+if ($scanId) {
+  $wizPortalUrl = "https://app.wiz.io/findings/cicd-scans#~%2528cicd_scan~%2527${scanId}%252A%2529"
+}
+
+# GitHub Actions run URL (prefer from JSON, fallback to parameter)
+$jobUrl = ""
+if ($wizJson.extraInfo -and $wizJson.extraInfo.buildParams) {
+  $jobUrl = Safe-Str $wizJson.extraInfo.buildParams.jobUrl
+}
+if ([string]::IsNullOrWhiteSpace($jobUrl) -and -not [string]::IsNullOrWhiteSpace($GitHubRunUrl)) {
+  $jobUrl = $GitHubRunUrl
+}
+
+$commitUrl = ""
+if ($wizJson.extraInfo -and $wizJson.extraInfo.buildParams) {
+  $commitUrl = Safe-Str $wizJson.extraInfo.buildParams.commitUrl
+}
+
+$repository = ""
+if ($wizJson.extraInfo -and $wizJson.extraInfo.buildParams) {
+  $repository = Safe-Str $wizJson.extraInfo.buildParams.repository
+}
+
+$imageName = ""
+if ($wizJson.scanOriginResource -and $wizJson.scanOriginResource.name) {
+  $imageName = Safe-Str $wizJson.scanOriginResource.name
+}
+
+$imageDigest = ""
+if ($wizJson.scanOriginResource) {
+  $imageDigest = Safe-Str $wizJson.scanOriginResource.id
+  if (-not $imageDigest) { $imageDigest = Safe-Str $wizJson.scanOriginResource.digest }
+}
+
+$wizcliVersion = ""
+if ($wizJson.extraInfo) { $wizcliVersion = Safe-Str $wizJson.extraInfo.clientVersion }
+
+# ─── parse packages ──────────────────────────────────────────────────────────
+# Direct structured parsing — no recursive traversal.
+# All needed data is at .result.vulnerableSBOMArtifactsByNameVersion[]
+
+$packages        = [System.Collections.Generic.List[object]]::new()
+$detailedFindings = [System.Collections.Generic.List[object]]::new()
+$totalC = 0; $totalH = 0; $totalM = 0; $totalL = 0
+
+$artifacts = $null
+if ($wizJson.result) {
+  $artifacts = $wizJson.result.vulnerableSBOMArtifactsByNameVersion
+}
+
+if ($null -ne $artifacts) {
+  foreach ($art in $artifacts) {
+    if ($null -eq $art) { continue }
+
+    $pkgName    = Safe-Str $art.name "unknown-package"
+    $pkgVersion = Safe-Str $art.version "-"
+    $pkgType    = if ($art.type) { Safe-Str $art.type.group "" } else { "" }
+
+    $vf = $art.vulnerabilityFindings
+    if ($null -eq $vf) { continue }
+
+    $fixedVersion = Safe-Str $vf.fixedVersion "unknown-fixed-version"
+    $remediation  = Safe-Str $vf.remediation  "Upgrade package using your package manager."
+
+    $sev = $vf.severities
+    $c = Safe-Int ($null -ne $sev ? $sev.criticalCount : 0)
+    $h = Safe-Int ($null -ne $sev ? $sev.highCount     : 0)
+    $m = Safe-Int ($null -ne $sev ? $sev.mediumCount   : 0)
+    $l = Safe-Int ($null -ne $sev ? $sev.lowCount      : 0)
+    $t = $c + $h + $m + $l
+    if ($t -le 0) { continue }
+
+    $totalC += $c; $totalH += $h; $totalM += $m; $totalL += $l
+
+    $packages.Add([ordered]@{
+      name         = $pkgName
+      version      = $pkgVersion
+      fixedVersion = $fixedVersion
+      remediation  = $remediation
+      critical     = $c
+      high         = $h
+      medium       = $m
+      low          = $l
+      total        = $t
+      pkgType      = $pkgType
+    })
+
+    # Per-CVE findings array (may be null — Wiz only returns these with expanded API tier)
+    if ($vf.findings -and $vf.findings.Count -gt 0) {
+      foreach ($fi in $vf.findings) {
+        if ($null -eq $fi) { continue }
+
+        $cveId   = Safe-Str $fi.name ""
+        $normCve = Normalize-Cve -t $cveId
+        if ($normCve) { $cveId = $normCve }
+
+        $cveDesc   = Safe-Str $fi.description "No description available."
+        $cveLink   = Safe-Str $fi.link ""
+        $cveSevRaw = (Safe-Str $fi.severity "").ToUpper()
+
+        # Per-CVE fixedVersion may differ from package-level
+        $cveFix = $fixedVersion
+        if ($fi.fixedVersions -and $fi.fixedVersions.Count -gt 0) {
+          $cveFix = Safe-Str $fi.fixedVersions[0] $fixedVersion
         }
+
+        # Build NVD link if vendor link absent
+        if ([string]::IsNullOrWhiteSpace($cveLink)) {
+          $nvdId = Normalize-Cve -t $cveId
+          if ($nvdId) { $cveLink = "https://nvd.nist.gov/vuln/detail/$nvdId" }
+        }
+
+        $fc = if ($cveSevRaw -eq "CRITICAL") { 1 } else { 0 }
+        $fh = if ($cveSevRaw -eq "HIGH")     { 1 } else { 0 }
+        $fm = if ($cveSevRaw -eq "MEDIUM")   { 1 } else { 0 }
+        $fl = if ($cveSevRaw -eq "LOW")      { 1 } else { 0 }
+        if (($fc + $fh + $fm + $fl) -eq 0) { $fh = 1 }
+
+        $detailedFindings.Add([ordered]@{
+          package      = $pkgName
+          version      = $pkgVersion
+          fixedVersion = $cveFix
+          remediation  = $remediation
+          cve          = $(if ($cveId) { $cveId } else { Safe-PkgId $pkgName $pkgVersion })
+          description  = $cveDesc
+          link         = $cveLink
+          severity     = $(if ($cveSevRaw) { $cveSevRaw } else { Max-Sev $fc $fh $fm $fl })
+          critical     = $fc
+          high         = $fh
+          medium       = $fm
+          low          = $fl
+          total        = ($fc + $fh + $fm + $fl)
+        })
       }
-    }
+    } else {
+      # No per-CVE breakdown — emit one aggregate finding per package
+      $pkgRuleId  = Safe-PkgId $pkgName $pkgVersion
+      $nvdSearch  = "https://nvd.nist.gov/vuln/search/results?query=$([System.Uri]::EscapeDataString($pkgName))&queryType=phrase"
 
-    foreach ($prop in $Node.PSObject.Properties) {
-      $value = $prop.Value
-      if ($null -eq $value) { continue }
-      if ($value -is [string] -and -not [string]::IsNullOrWhiteSpace($value)) { continue }
-      if ($value -is [int] -or $value -is [double] -or $value -is [bool]) { continue }
-      $found = Find-PropertyValueRecursive -Node $value -PropertyNames $PropertyNames -Visited $Visited
-      if ($found) { return $found }
-    }
-  }
-
-  if ($Node -is [System.Collections.IEnumerable] -and -not ($Node -is [string])) {
-    foreach ($item in $Node) {
-      if ($item -is [string] -or $item -is [int] -or $item -is [double] -or $item -is [bool] -or $null -eq $item) { continue }
-      $found = Find-PropertyValueRecursive -Node $item -PropertyNames $PropertyNames -Visited $Visited
-      if ($found) { return $found }
-    }
-  }
-
-  return $null
-}
-
-$script:Verdict = "UNKNOWN"
-$script:WizUrl = ""
-$script:WizCloudUrl = ""
-$script:Packages = @{}
-$script:DetailedFindings = [System.Collections.Generic.List[object]]::new()
-
-function Process-Node {
-  param($Node)
-
-  if ($null -eq $Node) { return @() }
-
-  if ($Node -is [System.Collections.IEnumerable] -and -not ($Node -is [string]) -and -not ($Node.PSObject -and $Node.PSObject.Properties)) {
-    return @($Node)
-  }
-
-  if (-not ($Node.PSObject -and $Node.PSObject.Properties)) { return @() }
-
-  if ($script:Verdict -eq "UNKNOWN" -and $Node.status -and $Node.status.verdict) {
-    $script:Verdict = [string]$Node.status.verdict
-  }
-
-  foreach ($urlField in @("jobUrl", "scanUrl", "commitUrl", "url")) {
-    if ($Node.PSObject.Properties[$urlField] -and $Node.$urlField -is [string] -and $Node.$urlField -match "^https?://") {
-      $candidateUrl = [string]$Node.$urlField
-      if ($candidateUrl -match "wiz\.io" -and $script:WizCloudUrl -eq "") {
-        $script:WizCloudUrl = $candidateUrl
-      }
-      if ($script:WizUrl -eq "") {
-        $script:WizUrl = $candidateUrl
-      }
-    }
-  }
-
-  $pkgName = ""
-  $pkgVersion = "-"
-  if ($Node.type -and $Node.type.name) { $pkgName = [string]$Node.type.name }
-  elseif ($Node.name) { $pkgName = [string]$Node.name }
-  $pkgName = $pkgName.Trim()
-  if ($Node.type -and $Node.type.version) { $pkgVersion = [string]$Node.type.version }
-  elseif ($Node.version) { $pkgVersion = [string]$Node.version }
-
-  $critical = Get-NormalizedInt ($Node.criticalCount)
-  if ($critical -eq 0) { $critical = Get-NormalizedInt ($Node.vulnerabilityFindings.severities.criticalCount) }
-  if ($critical -eq 0) { $critical = Get-NormalizedInt ($Node.severities.criticalCount) }
-
-  $high = Get-NormalizedInt ($Node.highCount)
-  if ($high -eq 0) { $high = Get-NormalizedInt ($Node.vulnerabilityFindings.severities.highCount) }
-  if ($high -eq 0) { $high = Get-NormalizedInt ($Node.severities.highCount) }
-
-  $medium = Get-NormalizedInt ($Node.mediumCount)
-  if ($medium -eq 0) { $medium = Get-NormalizedInt ($Node.vulnerabilityFindings.severities.mediumCount) }
-  if ($medium -eq 0) { $medium = Get-NormalizedInt ($Node.severities.mediumCount) }
-
-  $low = Get-NormalizedInt ($Node.lowCount)
-  if ($low -eq 0) { $low = Get-NormalizedInt ($Node.vulnerabilityFindings.severities.lowCount) }
-  if ($low -eq 0) { $low = Get-NormalizedInt ($Node.severities.lowCount) }
-
-  $total = $critical + $high + $medium + $low
-  if (-not [string]::IsNullOrWhiteSpace($pkgName) -and $total -gt 0) {
-    $key = "$pkgName@$pkgVersion"
-    if (-not $script:Packages.ContainsKey($key)) {
-      $script:Packages[$key] = [ordered]@{
-        package = $pkgName
-        version = $pkgVersion
-        critical = 0
-        high = 0
-        medium = 0
-        low = 0
-        total = 0
-      }
-    }
-    $script:Packages[$key].critical += $critical
-    $script:Packages[$key].high += $high
-    $script:Packages[$key].medium += $medium
-    $script:Packages[$key].low += $low
-    $script:Packages[$key].total += $total
-  }
-
-  if ($Node.vulnerabilityFindings -and $Node.vulnerabilityFindings.findings) {
-    foreach ($finding in $Node.vulnerabilityFindings.findings) {
-      if ($null -eq $finding) { continue }
-
-      $cve = "UNKNOWN-CVE"
-      if ($finding.cves -and $finding.cves.Count -gt 0 -and $finding.cves[0]) {
-        $rawCve = [string]$finding.cves[0]
-        $normalized = Normalize-CveIdentifier -Text $rawCve
-        if ($normalized) { $cve = $normalized }
-      } elseif ($finding.id) {
-        $normalized = Normalize-CveIdentifier -Text ([string]$finding.id)
-        if ($normalized) { $cve = $normalized }
-      }
-
-      if ($cve -eq "UNKNOWN-CVE") {
-        $foundCve = Find-PropertyValueRecursive -Node $finding -PropertyNames @("cve", "cves", "cveId", "cveID", "vulnerabilityId", "vulnerabilityID", "id") -Visited ([System.Collections.Generic.HashSet[string]]::new())
-        $normalized = Normalize-CveIdentifier -Text ([string]$foundCve)
-        if ($normalized) { $cve = $normalized }
-      }
-
-      $currentVersion = Find-PropertyValueRecursive -Node $finding -PropertyNames @("currentVersion", "installedVersion", "packageVersion", "version", "current", "installed") -Visited ([System.Collections.Generic.HashSet[string]]::new())
-      if (-not $currentVersion) { $currentVersion = $pkgVersion }
-      $fixedVersion = Find-PropertyValueRecursive -Node $finding -PropertyNames @("fixedVersion", "fixedVersions", "patchedVersion", "upgradeVersion", "safeVersion", "recommendedVersion", "remediationVersion") -Visited ([System.Collections.Generic.HashSet[string]]::new())
-      if (-not $fixedVersion) { $fixedVersion = "unknown-fixed-version" }
-
-      $fCritical = Get-NormalizedInt ($finding.severities.criticalCount)
-      if ($fCritical -eq 0) { $fCritical = Get-NormalizedInt ($finding.criticalCount) }
-      $fHigh = Get-NormalizedInt ($finding.severities.highCount)
-      if ($fHigh -eq 0) { $fHigh = Get-NormalizedInt ($finding.highCount) }
-      $fMedium = Get-NormalizedInt ($finding.severities.mediumCount)
-      if ($fMedium -eq 0) { $fMedium = Get-NormalizedInt ($finding.mediumCount) }
-      $fLow = Get-NormalizedInt ($finding.severities.lowCount)
-      if ($fLow -eq 0) { $fLow = Get-NormalizedInt ($finding.lowCount) }
-
-      $fTotal = $fCritical + $fHigh + $fMedium + $fLow
-      if ($fTotal -eq 0) {
-        $fCritical = $critical
-        $fHigh = $high
-        $fMedium = $medium
-        $fLow = $low
-        $fTotal = $fCritical + $fHigh + $fMedium + $fLow
-      }
-      if ($fTotal -eq 0) { continue }
-
-      $remediation = "No remediation details provided by Wiz."
-      if ($finding.remediation) { $remediation = [string]$finding.remediation }
-      elseif ($Node.remediation) { $remediation = [string]$Node.remediation }
-
-      $script:DetailedFindings.Add([ordered]@{
-        package = $(if ($pkgName) { $pkgName } else { "unknown-package" })
-        version = $pkgVersion
-        currentVersion = $currentVersion
+      $detailedFindings.Add([ordered]@{
+        package      = $pkgName
+        version      = $pkgVersion
         fixedVersion = $fixedVersion
-        cve = $cve
-        issueId = $cve
-        critical = $fCritical
-        high = $fHigh
-        medium = $fMedium
-        low = $fLow
-        total = $fTotal
-        remediation = $remediation
+        remediation  = $remediation
+        cve          = $pkgRuleId
+        description  = "Package '$pkgName' v$pkgVersion has $t vulnerabilities (C:$c H:$h M:$m L:$l). Upgrade to $fixedVersion."
+        link         = $nvdSearch
+        severity     = (Max-Sev $c $h $m $l)
+        critical     = $c
+        high         = $h
+        medium       = $m
+        low          = $l
+        total        = $t
       })
     }
   }
-
-  $children = @()
-  foreach ($prop in $Node.PSObject.Properties) {
-    $val = $prop.Value
-    if ($val -is [string] -or $val -is [int] -or $val -is [double] -or $val -is [bool] -or $null -eq $val) { continue }
-    $children += $val
-  }
-
-  return $children
 }
 
-function Merge-DetailedFindingsFromSarif {
-  param($SarifObject)
+Write-Host ""
+Write-Host "PARSER_COUNTS: packages=$($packages.Count) detailed_findings=$($detailedFindings.Count) verdict=$verdict"
 
-  if ($null -eq $SarifObject -or -not $SarifObject.runs -or $SarifObject.runs.Count -eq 0) { return }
+# ─── colorized console output ─────────────────────────────────────────────────
 
-  $run = $SarifObject.runs[0]
-  if (-not $run.results) { return }
+$esc          = [char]27
+$maxSevLabel  = Max-Sev $totalC $totalH $totalM $totalL
+$summaryColor = Color-Code -s $maxSevLabel
 
-  $ruleHelpById = @{}
-  if ($run.tool -and $run.tool.driver -and $run.tool.driver.rules) {
-    foreach ($rule in $run.tool.driver.rules) {
-      if ($rule.id) {
-        $helpText = ""
-        if ($rule.help -and $rule.help.text) { $helpText = [string]$rule.help.text }
-        $helpUri = ""
-        if ($rule.helpUri) { $helpUri = [string]$rule.helpUri }
-        $ruleHelpById[[string]$rule.id] = [ordered]@{ help = $helpText; helpUri = $helpUri }
-      }
-    }
-  }
+Write-Host ""
+Write-Host "╔══════════════════════════════════════════════════════════════════╗"
+Write-Host "║                   WIZ CONTAINER SCAN RESULTS                    ║"
+Write-Host "╚══════════════════════════════════════════════════════════════════╝"
+Write-Host ""
+Write-Host "${esc}[1mSCAN ID   :${esc}[0m $scanId"
+Write-Host "${esc}[1mIMAGE     :${esc}[0m $imageName"
+if ($imageDigest)  { Write-Host "${esc}[1mDIGEST    :${esc}[0m $imageDigest" }
+Write-Host "${esc}[1mREPO      :${esc}[0m $repository"
+if ($commitUrl)    { Write-Host "${esc}[1mCOMMIT    :${esc}[0m $commitUrl" }
+if ($jobUrl)       { Write-Host "${esc}[1mRUN URL   :${esc}[0m $jobUrl" }
+if ($wizPortalUrl) { Write-Host "${esc}[1mWIZ PORTAL:${esc}[0m ${esc}[36m$wizPortalUrl${esc}[0m" }
+Write-Host ""
+Write-Host ("${esc}[${summaryColor}mVERDICT: $verdict${esc}[0m  |  " +
+  "${esc}[31mCRITICAL: $totalC${esc}[0m  |  " +
+  "${esc}[33mHIGH: $totalH${esc}[0m  |  " +
+  "${esc}[34mMEDIUM: $totalM${esc}[0m  |  " +
+  "${esc}[37mLOW: $totalL${esc}[0m")
+Write-Host ""
 
-  $existing = [System.Collections.Generic.HashSet[string]]::new()
-  foreach ($f in $script:DetailedFindings) {
-    $k = "$(Get-NonEmptyString $f.package 'unknown-package')|$(Get-NonEmptyString $f.version '-')|$(Get-NonEmptyString $f.cve 'UNKNOWN-CVE')"
-    $null = $existing.Add($k)
-  }
+# ── Package summary table ─────────────────────────────────────────────────────
+Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+Write-Host "  PACKAGE SUMMARY  (top $([Math]::Min($packages.Count,60)) packages by total vulns)"
+Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-  foreach ($r in $run.results) {
-    $ruleId = Get-NonEmptyString $r.ruleId ""
-    $messageText = ""
-    if ($r.message -and $r.message.text) { $messageText = [string]$r.message.text }
+$sortedPkgs = $packages | Sort-Object -Property total -Descending | Select-Object -First 60
 
-    $cve = Normalize-CveIdentifier -Text $ruleId
-    if (-not $cve) { $cve = Normalize-CveIdentifier -Text $messageText }
-    if (-not $cve) {
-      if (-not [string]::IsNullOrWhiteSpace($ruleId)) { $cve = $ruleId }
-      else { $cve = "UNKNOWN-CVE" }
-    }
+$hdr = "  {0,-40} {1,-32} {2,-32} {3,5} {4,5} {5,5} {6,4} {7,6}" -f `
+  "PACKAGE", "CURRENT VERSION", "FIXED VERSION", "CRIT", "HIGH", "MED", "LOW", "TOTAL"
+Write-Host $hdr
+Write-Host ("  " + ("-" * 136))
 
-    $package = "unknown-package"
-    $version = "-"
-    $currentVersion = "-"
-    $fixedVersion = "unknown-fixed-version"
-
-    $pkgMatch = [regex]::Match($messageText, "Package:\s*([^@\r\n]+)@([^\r\n]+)")
-    if ($pkgMatch.Success) {
-      $package = Get-NonEmptyString $pkgMatch.Groups[1].Value "unknown-package"
-      $version = Get-NonEmptyString $pkgMatch.Groups[2].Value "-"
-      $currentVersion = $version
-    }
-
-    $currentMatch = [regex]::Match($messageText, "Current\s+version:\s*([^\r\n]+)")
-    if ($currentMatch.Success) {
-      $currentVersion = Get-NonEmptyString $currentMatch.Groups[1].Value $currentVersion
-    }
-
-    $fixedMatch = [regex]::Match($messageText, "Fixed\s+version:\s*([^\r\n]+)")
-    if ($fixedMatch.Success) {
-      $fixedVersion = Get-NonEmptyString $fixedMatch.Groups[1].Value $fixedVersion
-    }
-
-    $sevCounts = Parse-SeverityCountsFromText -Text $messageText
-    $critical = [int]$sevCounts.critical
-    $high = [int]$sevCounts.high
-    $medium = [int]$sevCounts.medium
-    $low = [int]$sevCounts.low
-
-    if (($critical + $high + $medium + $low) -eq 0) {
-      $lvl = Get-NonEmptyString $r.level "note"
-      switch ($lvl) {
-        "error" { $high = 1 }
-        "warning" { $medium = 1 }
-        default { $low = 1 }
-      }
-    }
-
-    $remediation = "Use your package manager to upgrade this package to a fixed version."
-    $fixMatch = [regex]::Match($messageText, "Fix guidance:\s*([^\r\n]+)")
-    if ($fixMatch.Success) {
-      $remediation = Get-NonEmptyString $fixMatch.Groups[1].Value $remediation
-    }
-
-    $referenceUrl = ""
-    if ($ruleId -and $ruleHelpById.ContainsKey($ruleId)) {
-      $ruleHelp = $ruleHelpById[$ruleId]
-      if ($ruleHelp.helpUri) { $referenceUrl = [string]$ruleHelp.helpUri }
-      if (-not $referenceUrl -and $ruleHelp.help) { $referenceUrl = Extract-FirstUrl -Text ([string]$ruleHelp.help) }
-    }
-    if (-not $referenceUrl) { $referenceUrl = Extract-FirstUrl -Text $messageText }
-    if (-not $referenceUrl) {
-      $normalizedCve = Normalize-CveIdentifier -Text $cve
-      if ($normalizedCve) { $referenceUrl = "https://nvd.nist.gov/vuln/detail/$normalizedCve" }
-    }
-
-    $key = "$package|$version|$cve"
-    if ($existing.Contains($key)) { continue }
-    $null = $existing.Add($key)
-
-    $script:DetailedFindings.Add([ordered]@{
-      package = $package
-      version = $version
-      currentVersion = $currentVersion
-      fixedVersion = $fixedVersion
-      cve = $cve
-      issueId = (Get-StableIssueId -Primary $ruleId -Fallback $cve -Package $package -Version $version)
-      sourceRuleId = $ruleId
-      critical = $critical
-      high = $high
-      medium = $medium
-      low = $low
-      total = ($critical + $high + $medium + $low)
-      remediation = $remediation
-      referenceUrl = $referenceUrl
-    })
-  }
+foreach ($p in $sortedPkgs) {
+  $sev = Max-Sev $p.critical $p.high $p.medium $p.low
+  $col = Color-Code -s $sev
+  $pkgDisp = [string]$p.name;    if ($pkgDisp.Length -gt 40) { $pkgDisp = $pkgDisp.Substring(0,39) + "…" }
+  $curDisp = [string]$p.version; if ($curDisp.Length -gt 32) { $curDisp = $curDisp.Substring(0,31) + "…" }
+  $fixDisp = [string]$p.fixedVersion; if ($fixDisp.Length -gt 32) { $fixDisp = $fixDisp.Substring(0,31) + "…" }
+  $line = "  ${esc}[${col}m{0,-40}${esc}[0m {1,-32} {2,-32} {3,5} {4,5} {5,5} {6,4} {7,6}" -f `
+    $pkgDisp, $curDisp, $fixDisp, $p.critical, $p.high, $p.medium, $p.low, $p.total
+  Write-Host $line
 }
 
-$inputs = @()
-$wizJson = Get-JsonObject -Path $WizJsonPath
-if ($wizJson) { $inputs += $wizJson }
-$wizStdout = Get-JsonObject -Path $WizStdoutPath
-if ($wizStdout) { $inputs += $wizStdout }
+# ── Detailed findings table ────────────────────────────────────────────────────
+Write-Host ""
+Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+Write-Host "  DETAILED FINDINGS  (sorted by severity, up to 200)"
+Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-if ($inputs.Count -eq 0) {
-  throw "No parseable Wiz JSON inputs found at $WizJsonPath or $WizStdoutPath"
+$sevOrder = @{ "CRITICAL" = 0; "HIGH" = 1; "MEDIUM" = 2; "LOW" = 3; "INFO" = 4 }
+$sortedFindings = $detailedFindings | Sort-Object -Property @{
+  Expression = { $sevOrder[([string]$_.severity).ToUpper()] }
+}, total -Descending | Select-Object -First 200
+
+$dhdr = "  {0,-38} {1,-22} {2,-9} {3,-32} {4,-32} {5}" -f `
+  "PACKAGE @ VERSION", "CVE / RULE ID", "SEVERITY", "CURRENT VERSION", "FIXED VERSION", "REMEDIATION / REF"
+Write-Host $dhdr
+Write-Host ("  " + ("-" * 178))
+
+foreach ($f in $sortedFindings) {
+  $sev = (Safe-Str $f.severity "INFO").ToUpper()
+  $col = Color-Code -s $sev
+
+  $pkgVer = "$($f.package)@$($f.version)"
+  if ($pkgVer.Length -gt 38) { $pkgVer = $pkgVer.Substring(0,37) + "…" }
+
+  $cveDisp = Safe-Str $f.cve "n/a"
+  if ($cveDisp.Length -gt 22) { $cveDisp = $cveDisp.Substring(0,21) + "…" }
+
+  $curDisp = Safe-Str $f.version "-"
+  if ($curDisp.Length -gt 32) { $curDisp = $curDisp.Substring(0,31) + "…" }
+
+  $fixDisp = Safe-Str $f.fixedVersion "unknown-fixed-version"
+  if ($fixDisp.Length -gt 32) { $fixDisp = $fixDisp.Substring(0,31) + "…" }
+
+  $remDisp = Safe-Str $f.remediation ""
+  $refLink = Safe-Str $f.link ""
+  $remRef  = if ($refLink) { "$remDisp | $refLink" } else { $remDisp }
+  if ($remRef.Length -gt 80) { $remRef = $remRef.Substring(0,79) + "…" }
+
+  $line = "  ${esc}[${col}m{0,-38}${esc}[0m {1,-22} ${esc}[${col}m{2,-9}${esc}[0m {3,-32} {4,-32} {5}" -f `
+    $pkgVer, $cveDisp, $sev, $curDisp, $fixDisp, $remRef
+  Write-Host $line
 }
 
-foreach ($obj in $inputs) {
-  $stack = [System.Collections.Stack]::new()
-  $stack.Push($obj)
-  while ($stack.Count -gt 0) {
-    $node = $stack.Pop()
-    $children = Process-Node -Node $node
-    foreach ($child in $children) {
-      if ($null -ne $child) { $stack.Push($child) }
-    }
-  }
+Write-Host ""
+Write-Host "${esc}[1mTotal packages   : $($packages.Count)${esc}[0m"
+Write-Host "${esc}[1mTotal findings   : $($detailedFindings.Count)${esc}[0m"
+if ($wizPortalUrl) {
+  Write-Host "${esc}[36mView in Wiz Portal: $wizPortalUrl${esc}[0m"
+}
+if ($verdict -notin @("PASS", "SUCCESS")) {
+  Write-Host "${esc}[31m$AppSecContact${esc}[0m"
 }
 
-$jsonFindingCount = $script:DetailedFindings.Count
+# ─── Build GitHub SARIF ──────────────────────────────────────────────────────
 
-$wizSarif = Get-JsonObject -Path $WizSarifPath
-if ($wizSarif) {
-  Merge-DetailedFindingsFromSarif -SarifObject $wizSarif
-}
-$sarifEnrichedCount = $script:DetailedFindings.Count - $jsonFindingCount
-if ($sarifEnrichedCount -lt 0) { $sarifEnrichedCount = 0 }
-
-if ($script:WizCloudUrl) {
-  $script:WizUrl = $script:WizCloudUrl
-} elseif ($GitHubRunUrl -and $script:WizUrl -eq "") {
-  $script:WizUrl = $GitHubRunUrl
-}
-
-$rowFallbackCount = 0
-
-$rows = $script:Packages.Values |
-  Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.package) -and [int]$_.total -gt 0 } |
-  Sort-Object -Property total -Descending
-
-if ($rows.Count -eq 0 -and $script:DetailedFindings.Count -gt 0) {
-  $agg = @{}
-  foreach ($f in $script:DetailedFindings) {
-    $pkg = Get-NonEmptyString $f.package "unknown-package"
-    $ver = Get-NonEmptyString $f.version "-"
-    $k = "$pkg@$ver"
-    if (-not $agg.ContainsKey($k)) {
-      $agg[$k] = [ordered]@{ package = $pkg; version = $ver; critical = 0; high = 0; medium = 0; low = 0; total = 0 }
-    }
-    $agg[$k].critical += [int](Get-NormalizedInt $f.critical)
-    $agg[$k].high += [int](Get-NormalizedInt $f.high)
-    $agg[$k].medium += [int](Get-NormalizedInt $f.medium)
-    $agg[$k].low += [int](Get-NormalizedInt $f.low)
-    $agg[$k].total += [int](Get-NormalizedInt $f.total)
-  }
-  $rows = $agg.Values | Sort-Object -Property total -Descending
-}
-
-if ($script:DetailedFindings.Count -eq 0) {
-  foreach ($r in $rows) {
-    $pkg = Get-MapString -Obj $r -Key "package" -Default "unknown-package"
-    $ver = Get-MapString -Obj $r -Key "version" -Default "-"
-    $criticalVal = Get-MapInt -Obj $r -Key "critical"
-    $highVal = Get-MapInt -Obj $r -Key "high"
-    $mediumVal = Get-MapInt -Obj $r -Key "medium"
-    $lowVal = Get-MapInt -Obj $r -Key "low"
-    $totalVal = Get-MapInt -Obj $r -Key "total"
-    if ($totalVal -le 0) { continue }
-    $rowFallbackCount += 1
-    $fallbackIssueId = Get-StableIssueId -Primary "" -Fallback "" -Package $pkg -Version $ver
-    $script:DetailedFindings.Add([ordered]@{
-      package = $pkg
-      version = $ver
-      currentVersion = $ver
-      fixedVersion = "unknown-fixed-version"
-      cve = $fallbackIssueId
-      issueId = $fallbackIssueId
-      critical = $criticalVal
-      high = $highVal
-      medium = $mediumVal
-      low = $lowVal
-      total = $totalVal
-      remediation = "Use your package manager to upgrade this package to a fixed version."
-      referenceUrl = $(if ($script:WizUrl) { $script:WizUrl } else { "" })
-    })
-  }
-}
-$totals = [ordered]@{ critical = 0; high = 0; medium = 0; low = 0 }
-foreach ($r in $rows) {
-  $totals.critical += [int]$r.critical
-  $totals.high += [int]$r.high
-  $totals.medium += [int]$r.medium
-  $totals.low += [int]$r.low
-}
-
-$esc = [char]27
-$maxSev = Get-MaxSeverityLabel -Critical $totals.critical -High $totals.high -Medium $totals.medium -Low $totals.low
-$summaryColor = Get-ColorCode -Severity $maxSev
-
-Write-Host "===== WIZ SCAN SUMMARY ====="
-Write-Host (("{0}[{1}mVERDICT: {2}  CRITICAL: {3}  HIGH: {4}  MEDIUM: {5}  LOW: {6}{0}[0m" -f $esc, $summaryColor, $script:Verdict, $totals.critical, $totals.high, $totals.medium, $totals.low))
-Write-Host "PARSER_COUNTS: json_findings=$jsonFindingCount sarif_enriched=$sarifEnrichedCount total_findings=$($script:DetailedFindings.Count)"
-Write-Host "PARSER_FALLBACK: package_rows=$($rows.Count) row_enriched_findings=$rowFallbackCount"
-
-if ($script:WizUrl) {
-  Write-Host "WIZ_SCAN_URL: $($script:WizUrl)"
-}
-
-if ($script:Verdict -notin @("PASS", "SUCCESS")) {
-  Write-Host (("{0}[31m{1}{0}[0m" -f $esc, $AppSecContact))
-}
-
-Write-Host "===== TOP PACKAGES BY VULNERABILITY COUNT ====="
-$packageRowsForDisplay = @()
-foreach ($r in $rows) {
-  $pkg = Get-MapString -Obj $r -Key "package" -Default ""
-  $ver = Get-MapString -Obj $r -Key "version" -Default "-"
-  $criticalVal = Get-MapInt -Obj $r -Key "critical"
-  $highVal = Get-MapInt -Obj $r -Key "high"
-  $mediumVal = Get-MapInt -Obj $r -Key "medium"
-  $lowVal = Get-MapInt -Obj $r -Key "low"
-  $totalVal = Get-MapInt -Obj $r -Key "total"
-  if ([string]::IsNullOrWhiteSpace($pkg) -or $totalVal -le 0) { continue }
-  $packageRowsForDisplay += [pscustomobject]@{
-    package = $pkg
-    version = $ver
-    critical = $criticalVal
-    high = $highVal
-    medium = $mediumVal
-    low = $lowVal
-    total = $totalVal
-  }
-}
-
-if ($packageRowsForDisplay.Count -eq 0) {
-  Write-Host "No package breakdown found in Wiz JSON. Using rule-level fallback from SARIF results."
-} else {
-  $packageRowsForDisplay | Select-Object -First 50 package, version, critical, high, medium, low, total | Format-Table -AutoSize | Out-String | Write-Host
-}
-
-Write-Host "===== DETAILED FINDINGS ====="
-$detailRows = $script:DetailedFindings | Sort-Object -Property total -Descending | Select-Object -First 150
-if ($detailRows.Count -eq 0) {
-  Write-Host "No detailed findings were parsed from the Wiz JSON payload."
-} else {
-  $header = @("PACKAGE", "ISSUE", "SEVERITY", "CURRENT VERSION", "FIXED VERSION", "CRITICAL", "HIGH", "MEDIUM", "LOW", "REFERENCE", "FIX")
-  $header -join " | " | Write-Host
-  ("-" * 220) | Write-Host
-  foreach ($finding in $detailRows) {
-    $sev = Get-MaxSeverityLabel -Critical $finding.critical -High $finding.high -Medium $finding.medium -Low $finding.low
-    $sevText = Get-ColorizedSeverity -Severity $sev
-    $fix = $finding.remediation
-    if ($fix.Length -gt 120) { $fix = $fix.Substring(0, 117) + "..." }
-    $current = if ($finding.currentVersion) { $finding.currentVersion } else { $finding.version }
-    $fixed = if ($finding.fixedVersion) { $finding.fixedVersion } else { "unknown-fixed-version" }
-    $guidance = Get-UpgradeGuidance -CurrentVersion $current -FixedVersion $fixed -Remediation $fix
-    $refUrl = Get-NonEmptyString $finding.referenceUrl ""
-    $issue = Get-StableIssueId -Primary (Get-NonEmptyString $finding.issueId "") -Fallback (Get-NonEmptyString $finding.cve "") -Package (Get-NonEmptyString $finding.package "unknown-package") -Version (Get-NonEmptyString $finding.version "-")
-    if ($refUrl) { $guidance = "$guidance Ref: $refUrl" }
-    @(
-      $finding.package,
-      $issue,
-      $sevText,
-      $current,
-      $fixed,
-      $finding.critical,
-      $finding.high,
-      $finding.medium,
-      $finding.low,
-      $(if ($refUrl) { $refUrl } else { "n/a" }),
-      $guidance
-    ) -join " | " | Write-Host
-  }
-}
-
-$rules = @{}
+$rules   = [ordered]@{}
 $results = [System.Collections.Generic.List[object]]::new()
 
-foreach ($f in $script:DetailedFindings) {
+foreach ($f in $detailedFindings) {
   if ($f.total -le 0) { continue }
-  $sev = Get-MaxSeverityLabel -Critical $f.critical -High $f.high -Medium $f.medium -Low $f.low
-  $level = Get-SarifLevel -Severity $sev
-  $pkgShort = Get-ShortPackage -Name $f.package
-  $issueId = Get-StableIssueId -Primary (Get-NonEmptyString $f.issueId "") -Fallback (Get-NonEmptyString $f.cve "") -Package (Get-NonEmptyString $f.package "unknown-package") -Version (Get-NonEmptyString $f.version "-")
-  $cve = Normalize-CveIdentifier -Text $issueId
-  $currentVersion = if ($f.currentVersion) { [string]$f.currentVersion } else { [string]$f.version }
-  $fixedVersion = if ($f.fixedVersion) { [string]$f.fixedVersion } else { "unknown-fixed-version" }
-  $upgradeGuidance = Get-UpgradeGuidance -CurrentVersion $currentVersion -FixedVersion $fixedVersion -Remediation $f.remediation
-  $referenceUrl = Get-NonEmptyString $f.referenceUrl ""
-  if (-not $referenceUrl) {
-    $normalizedCveForRef = Normalize-CveIdentifier -Text $issueId
-    if ($normalizedCveForRef) { $referenceUrl = "https://nvd.nist.gov/vuln/detail/$normalizedCveForRef" }
-    elseif ($script:WizUrl) { $referenceUrl = $script:WizUrl }
-  }
-  $subject = "[Wiz-Cloud-Scan] $issueId $pkgShort"
-  $ruleId = $issueId
 
-  $helpText = "Current version: $currentVersion`nFixed version: $fixedVersion`nFix guidance: $upgradeGuidance"
-  if ($referenceUrl) { $helpText += "`nReference: $referenceUrl" }
-  if ($script:WizUrl) { $helpText += "`nWiz Portal URL: $($script:WizUrl)" }
+  $sev    = (Safe-Str $f.severity "LOW").ToUpper()
+  $level  = Sev-Level -s $sev
+  $ruleId = Safe-Str $f.cve (Safe-PkgId $f.package $f.version)
+  $pkgAt  = "$($f.package)@$($f.version)"
+  $fixedV = Safe-Str $f.fixedVersion "unknown-fixed-version"
+  $curV   = Safe-Str $f.version "-"
+  $ref    = Safe-Str $f.link ""
+  $desc   = Safe-Str $f.description "Vulnerability detected by Wiz container image scan."
+
+  # Ensure a reference URL
+  if ([string]::IsNullOrWhiteSpace($ref)) {
+    $nvdId = Normalize-Cve -t $ruleId
+    if ($nvdId) { $ref = "https://nvd.nist.gov/vuln/detail/$nvdId" }
+    elseif ($wizPortalUrl) { $ref = $wizPortalUrl }
+  }
+
+  $secSeverity = switch ($sev) {
+    "CRITICAL" { "9.5" }
+    "HIGH"     { "7.5" }
+    "MEDIUM"   { "5.0" }
+    default    { "2.0" }
+  }
+
+  $helpText  = "Package: $pkgAt`n"
+  $helpText += "CVE / Rule: $ruleId`n"
+  $helpText += "Severity: $sev`n"
+  $helpText += "Current version: $curV`n"
+  $helpText += "Fixed version: $fixedV`n"
+  $helpText += "Remediation: $($f.remediation)`n"
+  if ($ref)          { $helpText += "Reference: $ref`n" }
+  if ($wizPortalUrl) { $helpText += "Wiz Portal: $wizPortalUrl`n" }
+  if ($jobUrl)       { $helpText += "CI Run: $jobUrl`n" }
   $helpText += "`n$AppSecContact"
 
   if (-not $rules.ContainsKey($ruleId)) {
-    $rules[$ruleId] = [ordered]@{
-      id = $ruleId
-      shortDescription = @{ text = $subject }
-      fullDescription = @{ text = "Container vulnerability detected by Wiz for package $($f.package). Current version: $currentVersion. Fixed version: $fixedVersion." }
+    $ruleObj = [ordered]@{
+      id               = $ruleId
+      name             = $ruleId
+      shortDescription = @{ text = "[Wiz] $ruleId in $($f.package)" }
+      fullDescription  = @{ text = $desc }
       defaultConfiguration = @{ level = $level }
-      help = @{ text = $helpText }
+      help             = @{ text = $helpText; markdown = $helpText }
+      properties       = @{
+        tags                = @("wiz", "container", "vulnerability")
+        "security-severity" = $secSeverity
+      }
     }
+    if ($ref) { $ruleObj["helpUri"] = $ref }
+    $rules[$ruleId] = $ruleObj
   }
 
-  $msg = @(
-    $subject,
-    "Package: $($f.package)@$($f.version)",
-    "Issue ID: $issueId",
-    "Current version: $currentVersion",
-    "Fixed version: $fixedVersion",
-    "Severity counts: critical=$($f.critical), high=$($f.high), medium=$($f.medium), low=$($f.low)",
-    "Fix guidance: $upgradeGuidance",
-    "Wiz verdict: $($script:Verdict)",
-    $AppSecContact
+  $msgLines = @(
+    "[Wiz] $ruleId — $pkgAt",
+    "Severity: $sev  (C:$($f.critical) H:$($f.high) M:$($f.medium) L:$($f.low))",
+    "Current version: $curV",
+    "Fixed version: $fixedV",
+    "Remediation: $($f.remediation)",
+    $desc
   )
-  if ($referenceUrl) { $msg += "Reference: $referenceUrl" }
-  if ($script:WizUrl) { $msg += "Wiz URL: $($script:WizUrl)" }
+  if ($ref)          { $msgLines += "Reference: $ref" }
+  if ($wizPortalUrl) { $msgLines += "Wiz Portal: $wizPortalUrl" }
+  if ($jobUrl)       { $msgLines += "CI Run: $jobUrl" }
+  $msgLines += $AppSecContact
 
   $results.Add([ordered]@{
-    ruleId = $ruleId
-    level = $level
-    message = @{ text = ($msg -join "`n") }
+    ruleId  = $ruleId
+    level   = $level
+    message = @{ text = ($msgLines -join "`n") }
     locations = @(
       @{
         physicalLocation = @{
-          artifactLocation = @{ uri = "Dockerfile" }
-          region = @{ startLine = 1 }
+          artifactLocation = @{ uri = "Dockerfile"; uriBaseId = "%SRCROOT%" }
+          region           = @{ startLine = 1 }
         }
+        logicalLocations = @(
+          @{ name = $pkgAt; kind = "package" }
+        )
       }
     )
-    partialFingerprints = @{ primary = "$($f.package)@$($f.version)|$cve" }
+    partialFingerprints = @{
+      primary        = "$pkgAt|$ruleId"
+      packageName    = Safe-Str $f.package ""
+      packageVersion = Safe-Str $f.version ""
+    }
     properties = @{
-      subject = $subject
-      package = $f.package
-      packageVersion = $f.version
-      currentVersion = $currentVersion
-      fixedVersion = $fixedVersion
-      upgradeGuidance = $upgradeGuidance
-      referenceUrl = $referenceUrl
-      cve = $(if ($cve) { $cve } else { "" })
-      issueId = $issueId
-      severity = $sev
+      package      = Safe-Str $f.package ""
+      version      = Safe-Str $f.version ""
+      fixedVersion = $fixedV
+      severity     = $sev
+      cve          = $ruleId
+      wizPortalUrl = $wizPortalUrl
+      jobUrl       = $jobUrl
     }
   })
 }
 
-if ($results.Count -eq 0 -and $script:Verdict -notin @("PASS", "SUCCESS")) {
-  $subject = "[Wiz-Cloud-Scan] POLICY $((Get-ShortPackage -Name $script:Verdict))"
+# Fallback: emit policy-level result if nothing parsed
+if ($results.Count -eq 0) {
   $rules["WIZ-POLICY-VERDICT"] = [ordered]@{
-    id = "WIZ-POLICY-VERDICT"
-    shortDescription = @{ text = $subject }
-    fullDescription = @{ text = "Wiz reported policy verdict without parseable package-level details in JSON payload." }
+    id               = "WIZ-POLICY-VERDICT"
+    name             = "WIZ-POLICY-VERDICT"
+    shortDescription = @{ text = "[Wiz] Policy verdict: $verdict" }
+    fullDescription  = @{ text = "Wiz container scan verdict: $verdict. No package-level findings parsed." }
     defaultConfiguration = @{ level = "warning" }
-    help = @{ text = $AppSecContact }
+    help             = @{ text = $AppSecContact }
   }
   $results.Add([ordered]@{
-    ruleId = "WIZ-POLICY-VERDICT"
-    level = "warning"
-    message = @{ text = "$subject`nVerdict: $($script:Verdict)`nCurrent version: unknown`nFixed version: unknown-fixed-version`n$AppSecContact" }
+    ruleId    = "WIZ-POLICY-VERDICT"
+    level     = "warning"
+    message   = @{ text = "Wiz policy verdict: $verdict`n$AppSecContact" }
     locations = @(@{ physicalLocation = @{ artifactLocation = @{ uri = "Dockerfile" }; region = @{ startLine = 1 } } })
-    partialFingerprints = @{ policy = $script:Verdict }
   })
 }
 
 $sarif = [ordered]@{
-  version = "2.1.0"
+  version   = "2.1.0"
   '$schema' = "https://json.schemastore.org/sarif-2.1.0.json"
-  runs = @(
+  runs      = @(
     [ordered]@{
       tool = [ordered]@{
         driver = [ordered]@{
-          name = "WizCLI"
-          informationUri = "https://www.wiz.io/"
-          rules = @($rules.Values)
+          name           = "WizCLI"
+          version        = $wizcliVersion
+          informationUri = "https://docs.wiz.io/docs/scan-and-tag-container-images-with-wiz-cli"
+          rules          = @($rules.Values)
         }
       }
-      automationDetails = @{ id = "wiz-container-scan" }
-      invocations = @(@{ executionSuccessful = $true })
+      automationDetails = @{
+        id          = "wiz-container-scan/$scanId"
+        description = @{ text = "Wiz CLI container image scan" }
+      }
+      invocations = @(
+        @{
+          executionSuccessful = $true
+          commandLine         = "wizcli scan container-image"
+          properties          = @{
+            verdict    = $verdict
+            scanId     = $scanId
+            imageName  = $imageName
+            repository = $repository
+            jobUrl     = $jobUrl
+            wizPortal  = $wizPortalUrl
+          }
+        }
+      )
       results = @($results)
     }
   )
@@ -815,50 +544,64 @@ $sarif = [ordered]@{
 
 $sarif | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $OutputSarifPath -Encoding utf8
 
-$md = @()
-$md += "# Wiz Container Scan Summary"
-$md += ""
-$md += "- Verdict: **$($script:Verdict)**"
-$md += "- Critical: **$($totals.critical)**"
-$md += "- High: **$($totals.high)**"
-$md += "- Medium: **$($totals.medium)**"
-$md += "- Low: **$($totals.low)**"
-if ($script:WizUrl) { $md += "- Wiz Scan URL: $($script:WizUrl)" }
-$md += "- Contact: $AppSecContact"
-$md += ""
-$md += "## Top Packages"
-$md += ""
-$md += "| Package | Current Version | Fixed Version | Critical | High | Medium | Low | Total |"
-$md += "|---|---:|---:|---:|---:|---:|---:|---:|"
+# ─── GitHub Job Summary (markdown) ────────────────────────────────────────────
 
-$fixedVersionByPackageKey = @{}
-foreach ($f in $script:DetailedFindings) {
-  if (-not $f.package -or -not $f.version) { continue }
-  if (-not $f.fixedVersion -or $f.fixedVersion -eq "unknown-fixed-version") { continue }
-  $fixedVersionByPackageKey["$($f.package)@$($f.version)"] = [string]$f.fixedVersion
+$md = [System.Collections.Generic.List[string]]::new()
+$md.Add("# Wiz Container Scan Report")
+$md.Add("")
+$md.Add("| Field | Value |")
+$md.Add("|---|---|")
+$md.Add("| **Verdict** | ``$verdict`` |")
+$md.Add("| **Image** | ``$imageName`` |")
+$md.Add("| **Scan ID** | ``$scanId`` |")
+$md.Add("| **Critical** | $totalC |")
+$md.Add("| **High** | $totalH |")
+$md.Add("| **Medium** | $totalM |")
+$md.Add("| **Low** | $totalL |")
+if ($wizPortalUrl) { $md.Add("| **Wiz Portal** | [$wizPortalUrl]($wizPortalUrl) |") }
+if ($jobUrl)       { $md.Add("| **CI Run** | [$jobUrl]($jobUrl) |") }
+if ($commitUrl)    { $md.Add("| **Commit** | [$commitUrl]($commitUrl) |") }
+$md.Add("| **AppSec Contact** | $AppSecContact |")
+$md.Add("")
+
+$md.Add("## Top Vulnerable Packages")
+$md.Add("")
+$md.Add("| Package | Type | Current Version | Fixed Version | Critical | High | Medium | Low | Total | Remediation |")
+$md.Add("|---|---|---|---|---:|---:|---:|---:|---:|---|")
+foreach ($p in ($packages | Sort-Object -Property total -Descending | Select-Object -First 100)) {
+  $md.Add("| $($p.name) | $($p.pkgType) | ``$($p.version)`` | ``$($p.fixedVersion)`` | $($p.critical) | $($p.high) | $($p.medium) | $($p.low) | $($p.total) | $($p.remediation) |")
 }
+$md.Add("")
 
-foreach ($r in ($rows | Select-Object -First 100)) {
-  $pkgKey = "$($r.package)@$($r.version)"
-  $mdFixedVersion = "unknown-fixed-version"
-  if ($fixedVersionByPackageKey.ContainsKey($pkgKey)) {
-    $mdFixedVersion = $fixedVersionByPackageKey[$pkgKey]
+if ($sortedFindings.Count -gt 0) {
+  $md.Add("## Individual Findings")
+  $md.Add("")
+  $md.Add("| CVE / Rule | Package | Current Version | Fixed Version | Severity | Remediation | Reference |")
+  $md.Add("|---|---|---|---|---|---|---|")
+  foreach ($f in ($sortedFindings | Select-Object -First 150)) {
+    $refLink = if ($f.link) { "[$($f.link)]($($f.link))" } else { "n/a" }
+    $descShort = Safe-Str $f.description ""
+    if ($descShort.Length -gt 80) { $descShort = $descShort.Substring(0, 77) + "..." }
+    $md.Add("| ``$($f.cve)`` | $($f.package) | ``$($f.version)`` | ``$($f.fixedVersion)`` | **$($f.severity)** | $($f.remediation) | $refLink |")
   }
-  $md += "| $($r.package) | $($r.version) | $mdFixedVersion | $($r.critical) | $($r.high) | $($r.medium) | $($r.low) | $($r.total) |"
+  $md.Add("")
 }
-$md += ""
-$md += "## Parsed Finding Count"
-$md += ""
-$md += "- SARIF results generated: **$($results.Count)**"
 
-$md -join "`n" | Set-Content -LiteralPath $SummaryMarkdownPath -Encoding utf8
+$md.Add("## Summary")
+$md.Add("- Packages with vulnerabilities: **$($packages.Count)**")
+$md.Add("- SARIF results generated: **$($results.Count)**")
+$md.Add("- Findings parsed: **$($detailedFindings.Count)**")
 
-Write-Host "Generated $OutputSarifPath with $($results.Count) result(s)."
+$md | Set-Content -LiteralPath $SummaryMarkdownPath -Encoding utf8
+
+# ─── final notices ───────────────────────────────────────────────────────────
+
+Write-Host ""
+Write-Host "::notice::Wiz scan complete. Verdict=$verdict  C=$totalC H=$totalH M=$totalM L=$totalL"
+Write-Host "::notice::SARIF results: $($results.Count)  packages: $($packages.Count)  findings: $($detailedFindings.Count)"
+if ($wizPortalUrl) { Write-Host "::notice::Wiz Portal URL: $wizPortalUrl" }
+if ($jobUrl)       { Write-Host "::notice::CI Run URL: $jobUrl" }
+Write-Host "::notice::AppSec contact: $AppSecContact"
+Write-Host "Generated $OutputSarifPath ($($results.Count) results)"
 Write-Host "Generated $SummaryMarkdownPath"
-if ($script:WizUrl) { Write-Host "Latest Wiz scan URL: $($script:WizUrl)" }
-Write-Host "::notice::Wiz parsing complete. SARIF results: $($results.Count)."
-Write-Host "::notice::AppSec escalation contact: $AppSecContact"
 exit 0
-
-# Note: GitHub Security tab controls severity colors in its own UI.
-# This script uses ANSI colors in workflow logs for visual severity emphasis.
