@@ -32,14 +32,14 @@ param(
   [string]$OutputSarifPath     = "wiz-github.sarif",
   [string]$SummaryMarkdownPath = "wiz-summary.md",
   [string]$GitHubRunUrl        = "",
-  [string]$AppSecContact       = "Emergency: contact AppSec Team at appsec@company.com or #appsec-oncall"
+  [string]$AppSecContact       = "Emergency: contact AppSec Team at appsec@devsecopswithanshu.com or #appsec-oncall"
 )
 
 Set-StrictMode -Off
 $ErrorActionPreference = "Stop"
 
 if ([string]::IsNullOrWhiteSpace($AppSecContact)) {
-  $AppSecContact = "Emergency: contact AppSec Team at appsec@company.com or #appsec-oncall"
+  $AppSecContact = "Emergency: contact AppSec Team at appsec@devsecopswithanshu.com or #appsec-oncall"
 }
 
 # ─── helpers ────────────────────────────────────────────────────────────────
@@ -311,10 +311,10 @@ Write-Host ""
 
 # ── Package summary table ─────────────────────────────────────────────────────
 Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-Write-Host "  PACKAGE SUMMARY  (top $([Math]::Min($packages.Count,60)) packages by total vulns)"
+Write-Host "  PACKAGE SUMMARY  (top $([Math]::Min($packages.Count,60)) packages — sorted Critical → High → Medium → Low)"
 Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-$sortedPkgs = $packages | Sort-Object -Property total -Descending | Select-Object -First 60
+$sortedPkgs = $packages | Sort-Object -Property @{Expression={$_.critical};Descending=$true}, @{Expression={$_.high};Descending=$true}, @{Expression={$_.medium};Descending=$true}, @{Expression={$_.low};Descending=$true}, @{Expression={$_.total};Descending=$true} | Select-Object -First 60
 
 $hdr = "  {0,-40} {1,-32} {2,-32} {3,5} {4,5} {5,5} {6,4} {7,6}" -f `
   "PACKAGE", "CURRENT VERSION", "FIXED VERSION", "CRIT", "HIGH", "MED", "LOW", "TOTAL"
@@ -409,11 +409,19 @@ foreach ($f in $detailedFindings) {
   }
 
   $secSeverity = switch ($sev) {
-    "CRITICAL" { "9.5" }
-    "HIGH"     { "7.5" }
-    "MEDIUM"   { "5.0" }
-    default    { "2.0" }
+    "CRITICAL" { "9.9" }
+    "HIGH"     { "8.0" }
+    "MEDIUM"   { "5.5" }
+    "LOW"      { "2.5" }
+    default    { "0.0" }
   }
+
+  # Build display name — include CVE when extractable from ruleId or cve field
+  $cvePart = Normalize-Cve -t $ruleId
+  if (-not $cvePart) { $cvePart = Normalize-Cve -t (Safe-Str $f.cve "") }
+  $ruleDisplayName = if ($cvePart) { "[Wiz] $cvePart | $ruleId in $($f.package)" } else { "[Wiz] $ruleId in $($f.package)" }
+
+  $nvdExploitUrl = "https://nvd.nist.gov/vuln/search/results?query=$([System.Uri]::EscapeDataString($($f.package)))&queryType=phrase"
 
   $helpText  = "Package: $pkgAt`n"
   $helpText += "CVE / Rule: $ruleId`n"
@@ -421,16 +429,18 @@ foreach ($f in $detailedFindings) {
   $helpText += "Current version: $curV`n"
   $helpText += "Fixed version: $fixedV`n"
   $helpText += "Remediation: $($f.remediation)`n"
+  $helpText += "Description: $desc`n"
+  $helpText += "Public Exploit: Check NVD for known exploits — $nvdExploitUrl`n"
   if ($ref)          { $helpText += "Reference: $ref`n" }
   if ($wizPortalUrl) { $helpText += "Wiz Portal: $wizPortalUrl`n" }
-  if ($jobUrl)       { $helpText += "CI Run: $jobUrl`n" }
+  if ($jobUrl)       { $helpText += "CI Run (First Seen): $jobUrl`n" }
   $helpText += "`n$AppSecContact"
 
   if (-not $rules.Contains($ruleId)) {
     $ruleObj = [ordered]@{
       id               = $ruleId
-      name             = $ruleId
-      shortDescription = @{ text = "[Wiz] $ruleId in $($f.package)" }
+      name             = $ruleDisplayName
+      shortDescription = @{ text = $ruleDisplayName }
       fullDescription  = @{ text = $desc }
       defaultConfiguration = @{ level = $level }
       help             = @{ text = $helpText; markdown = $helpText }
@@ -444,16 +454,17 @@ foreach ($f in $detailedFindings) {
   }
 
   $msgLines = @(
-    "[Wiz] $ruleId — $pkgAt",
+    "$ruleDisplayName — $pkgAt",
     "Severity: $sev  (C:$($f.critical) H:$($f.high) M:$($f.medium) L:$($f.low))",
     "Current version: $curV",
     "Fixed version: $fixedV",
     "Remediation: $($f.remediation)",
-    $desc
+    "Description: $desc",
+    "Public Exploit: Check NVD for known exploits — $nvdExploitUrl"
   )
   if ($ref)          { $msgLines += "Reference: $ref" }
   if ($wizPortalUrl) { $msgLines += "Wiz Portal: $wizPortalUrl" }
-  if ($jobUrl)       { $msgLines += "CI Run: $jobUrl" }
+  if ($jobUrl)       { $msgLines += "CI Run (First Seen): $jobUrl" }
   $msgLines += $AppSecContact
 
   $results.Add([ordered]@{
@@ -568,7 +579,7 @@ $md.Add("## Top Vulnerable Packages")
 $md.Add("")
 $md.Add("| Package | Type | Current Version | Fixed Version | Critical | High | Medium | Low | Total | Remediation |")
 $md.Add("|---|---|---|---|---:|---:|---:|---:|---:|---|")
-foreach ($p in ($packages | Sort-Object -Property total -Descending | Select-Object -First 100)) {
+foreach ($p in ($packages | Sort-Object -Property @{Expression={$_.critical};Descending=$true}, @{Expression={$_.high};Descending=$true}, @{Expression={$_.medium};Descending=$true}, @{Expression={$_.low};Descending=$true}, @{Expression={$_.total};Descending=$true} | Select-Object -First 100)) {
   $md.Add("| $($p.name) | $($p.pkgType) | ``$($p.version)`` | ``$($p.fixedVersion)`` | $($p.critical) | $($p.high) | $($p.medium) | $($p.low) | $($p.total) | $($p.remediation) |")
 }
 $md.Add("")
@@ -576,13 +587,15 @@ $md.Add("")
 if ($sortedFindings.Count -gt 0) {
   $md.Add("## Individual Findings")
   $md.Add("")
-  $md.Add("| CVE / Rule | Package | Current Version | Fixed Version | Severity | Remediation | Reference |")
-  $md.Add("|---|---|---|---|---|---|---|")
+  $md.Add("| CVE / Rule | Package | Current Version | Fixed Version | Severity | Description | Public Exploit | Remediation | Reference |")
+  $md.Add("|---|---|---|---|---|---|---|---|---|")
   foreach ($f in ($sortedFindings | Select-Object -First 150)) {
     $refLink = if ($f.link) { "[$($f.link)]($($f.link))" } else { "n/a" }
     $descShort = Safe-Str $f.description ""
-    if ($descShort.Length -gt 80) { $descShort = $descShort.Substring(0, 77) + "..." }
-    $md.Add("| ``$($f.cve)`` | $($f.package) | ``$($f.version)`` | ``$($f.fixedVersion)`` | **$($f.severity)** | $($f.remediation) | $refLink |")
+    if ($descShort.Length -gt 120) { $descShort = $descShort.Substring(0, 117) + "..." }
+    $descShort = $descShort -replace '\|', '&#124;'
+    $exploitLink = "[NVD Search](https://nvd.nist.gov/vuln/search/results?query=$([System.Uri]::EscapeDataString($($f.package)))&queryType=phrase)"
+    $md.Add("| ``$($f.cve)`` | $($f.package) | ``$($f.version)`` | ``$($f.fixedVersion)`` | **$($f.severity)** | $descShort | $exploitLink | $($f.remediation) | $refLink |")
   }
   $md.Add("")
 }
