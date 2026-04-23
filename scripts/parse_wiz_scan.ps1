@@ -426,7 +426,7 @@ foreach ($f in $detailedFindings) {
   if ($jobUrl)       { $helpText += "CI Run: $jobUrl`n" }
   $helpText += "`n$AppSecContact"
 
-  if (-not $rules.ContainsKey($ruleId)) {
+  if (-not $rules.Contains($ruleId)) {
     $ruleObj = [ordered]@{
       id               = $ruleId
       name             = $ruleId
