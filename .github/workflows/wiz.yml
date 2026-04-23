@@ -59,31 +59,12 @@ jobs:
           ls -lh wiz.json wiz.sarif 2>/dev/null || echo "No output files found"
           echo "wiz.json lines: $(wc -l < wiz.json 2>/dev/null || echo 0)"
           echo "::endgroup::"
-          # Capture stdout scan summary for verbose logs
+          # Quick JSON summary for verbose logs (using jq)
           if [ -f wiz.json ]; then
-            python3 -c "
-import json, sys
-try:
-    d = json.load(open('wiz.json'))
-    v = d.get('status',{}).get('verdict','unknown')
-    sid = d.get('id','unknown')
-    res = d.get('result',{})
-    arts = res.get('vulnerableSBOMArtifactsByNameVersion',[]) or []
-    c=h=m=l=0
-    for a in arts:
-        vf = a.get('vulnerabilityFindings',{}) or {}
-        s = vf.get('severities',{}) or {}
-        c += s.get('criticalCount',0) or 0
-        h += s.get('highCount',0) or 0
-        m += s.get('mediumCount',0) or 0
-        l += s.get('lowCount',0) or 0
-    print(f'SCAN_ID={sid}')
-    print(f'VERDICT={v}')
-    print(f'PACKAGES={len(arts)}')
-    print(f'C={c} H={h} M={m} L={l}')
-except Exception as e:
-    print(f'JSON parse error: {e}')
-" || true
+            VERDICT=$(jq -r '.status.verdict // "unknown"' wiz.json 2>/dev/null || echo "unknown")
+            SCAN_ID=$(jq -r '.id // "unknown"' wiz.json 2>/dev/null || echo "unknown")
+            PACKAGES=$(jq -r '(.result.vulnerableSBOMArtifactsByNameVersion // []) | length' wiz.json 2>/dev/null || echo "0")
+            echo "SCAN_ID=$SCAN_ID  VERDICT=$VERDICT  VULNERABLE_PACKAGES=$PACKAGES"
           fi
 
       - name: Parse Wiz output and build rich SARIF
@@ -128,14 +109,14 @@ except Exception as e:
             exit 1
           fi
           SARIF_SIZE=$(wc -c < wiz-github.sarif)
-          SARIF_RESULTS=$(python3 -c "import json; s=json.load(open('wiz-github.sarif')); print(len(s['runs'][0]['results']))" 2>/dev/null || echo "parse-error")
-          SARIF_RULES=$(python3 -c "import json; s=json.load(open('wiz-github.sarif')); print(len(s['runs'][0]['tool']['driver']['rules']))" 2>/dev/null || echo "parse-error")
-          echo "::notice::SARIF file size: ${SARIF_SIZE} bytes | Rules: ${SARIF_RULES} | Results: ${SARIF_RESULTS}"
+          SARIF_RESULTS=$(jq '.runs[0].results | length' wiz-github.sarif 2>/dev/null || echo "parse-error")
+          SARIF_RULES=$(jq '.runs[0].tool.driver.rules | length' wiz-github.sarif 2>/dev/null || echo "parse-error")
+          echo "::notice::SARIF size: ${SARIF_SIZE}B | Rules: ${SARIF_RULES} | Results: ${SARIF_RESULTS}"
           echo "SARIF file size: ${SARIF_SIZE} bytes"
-          echo "SARIF rules: ${SARIF_RULES}"
+          echo "SARIF rules:   ${SARIF_RULES}"
           echo "SARIF results: ${SARIF_RESULTS}"
-          # Validate SARIF is valid JSON
-          python3 -c "import json; json.load(open('wiz-github.sarif')); print('SARIF JSON valid')" || { echo "::error::SARIF is not valid JSON"; exit 1; }
+          # Validate SARIF is well-formed JSON
+          jq empty wiz-github.sarif && echo "SARIF JSON valid" || { echo "::error::SARIF is not valid JSON"; exit 1; }
 
       - name: Upload SARIF to GitHub Security
         if: always()
