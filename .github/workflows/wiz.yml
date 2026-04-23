@@ -42,14 +42,49 @@ jobs:
           WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
           WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
         run: |
+          echo "::group::Wiz CLI scan details"
+          echo "Image: $TAG"
+          echo "Policy: $POLICY"
+          echo "Run URL: $GITHUB_RUN_URL"
           ./wizcli scan container-image "$TAG" \
             --policies "$POLICY" \
             --client-id  "$WIZ_CLIENT_ID" \
             --client-secret "$WIZ_CLIENT_SECRET" \
             --json-output-file wiz.json \
             --sarif-output-file wiz.sarif
-          echo "Wiz scan exit code: $?"
-          ls -lh wiz.json wiz.sarif 2>/dev/null || true
+          WIZ_EXIT=$?
+          echo "::endgroup::"
+          echo "Wiz scan exit code: $WIZ_EXIT"
+          echo "::group::Wiz output files"
+          ls -lh wiz.json wiz.sarif 2>/dev/null || echo "No output files found"
+          echo "wiz.json lines: $(wc -l < wiz.json 2>/dev/null || echo 0)"
+          echo "::endgroup::"
+          # Capture stdout scan summary for verbose logs
+          if [ -f wiz.json ]; then
+            python3 -c "
+import json, sys
+try:
+    d = json.load(open('wiz.json'))
+    v = d.get('status',{}).get('verdict','unknown')
+    sid = d.get('id','unknown')
+    res = d.get('result',{})
+    arts = res.get('vulnerableSBOMArtifactsByNameVersion',[]) or []
+    c=h=m=l=0
+    for a in arts:
+        vf = a.get('vulnerabilityFindings',{}) or {}
+        s = vf.get('severities',{}) or {}
+        c += s.get('criticalCount',0) or 0
+        h += s.get('highCount',0) or 0
+        m += s.get('mediumCount',0) or 0
+        l += s.get('lowCount',0) or 0
+    print(f'SCAN_ID={sid}')
+    print(f'VERDICT={v}')
+    print(f'PACKAGES={len(arts)}')
+    print(f'C={c} H={h} M={m} L={l}')
+except Exception as e:
+    print(f'JSON parse error: {e}')
+" || true
+          fi
 
       - name: Parse Wiz output and build rich SARIF
         if: always()
@@ -92,14 +127,25 @@ jobs:
             echo "::error::wiz-github.sarif was not generated — check parser step above"
             exit 1
           fi
-          echo "SARIF file size: $(wc -c < wiz-github.sarif) bytes"
+          SARIF_SIZE=$(wc -c < wiz-github.sarif)
+          SARIF_RESULTS=$(python3 -c "import json; s=json.load(open('wiz-github.sarif')); print(len(s['runs'][0]['results']))" 2>/dev/null || echo "parse-error")
+          SARIF_RULES=$(python3 -c "import json; s=json.load(open('wiz-github.sarif')); print(len(s['runs'][0]['tool']['driver']['rules']))" 2>/dev/null || echo "parse-error")
+          echo "::notice::SARIF file size: ${SARIF_SIZE} bytes | Rules: ${SARIF_RULES} | Results: ${SARIF_RESULTS}"
+          echo "SARIF file size: ${SARIF_SIZE} bytes"
+          echo "SARIF rules: ${SARIF_RULES}"
+          echo "SARIF results: ${SARIF_RESULTS}"
+          # Validate SARIF is valid JSON
+          python3 -c "import json; json.load(open('wiz-github.sarif')); print('SARIF JSON valid')" || { echo "::error::SARIF is not valid JSON"; exit 1; }
 
       - name: Upload SARIF to GitHub Security
         if: always()
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: wiz-github.sarif
+          # Fixed category — same category on every run = GitHub OVERWRITES previous results
+          # (existing alerts not in new upload are auto-closed by GitHub)
           category: wiz-container-scan
+          wait-for-processing: true
 
       - name: Enforce Wiz policy gate
         if: always()

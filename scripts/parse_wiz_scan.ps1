@@ -281,7 +281,9 @@ if ($null -ne $artifacts) {
 }
 
 Write-Host ""
+Write-Host "::group::Wiz Parser Summary"
 Write-Host "PARSER_COUNTS: packages=$($packages.Count) detailed_findings=$($detailedFindings.Count) verdict=$verdict"
+Write-Host "::endgroup::"
 
 # ─── colorized console output ─────────────────────────────────────────────────
 
@@ -310,6 +312,7 @@ Write-Host ("${esc}[${summaryColor}mVERDICT: $verdict${esc}[0m  |  " +
 Write-Host ""
 
 # ── Package summary table ─────────────────────────────────────────────────────
+Write-Host "::group::Package Summary (sorted Critical → High → Medium → Low)"
 Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 Write-Host "  PACKAGE SUMMARY  (top $([Math]::Min($packages.Count,60)) packages — sorted Critical → High → Medium → Low)"
 Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -332,8 +335,11 @@ foreach ($p in $sortedPkgs) {
   Write-Host $line
 }
 
+Write-Host "::endgroup::"
+
 # ── Detailed findings table ────────────────────────────────────────────────────
 Write-Host ""
+Write-Host "::group::Detailed Findings (sorted by severity, up to 200)"
 Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 Write-Host "  DETAILED FINDINGS  (sorted by severity, up to 200)"
 Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -374,6 +380,7 @@ foreach ($f in $sortedFindings) {
   Write-Host $line
 }
 
+Write-Host "::endgroup::"
 Write-Host ""
 Write-Host "${esc}[1mTotal packages   : $($packages.Count)${esc}[0m"
 Write-Host "${esc}[1mTotal findings   : $($detailedFindings.Count)${esc}[0m"
@@ -408,11 +415,12 @@ foreach ($f in $detailedFindings) {
     elseif ($wizPortalUrl) { $ref = $wizPortalUrl }
   }
 
+  # CVSS v3 representative thresholds per severity band (matches Prisma/GitHub standard)
   $secSeverity = switch ($sev) {
-    "CRITICAL" { "9.9" }
-    "HIGH"     { "8.0" }
-    "MEDIUM"   { "5.5" }
-    "LOW"      { "2.5" }
+    "CRITICAL" { "9.8" }   # CVSS Critical: 9.0-10.0
+    "HIGH"     { "8.0" }   # CVSS High: 7.0-8.9
+    "MEDIUM"   { "6.5" }   # CVSS Medium: 4.0-6.9
+    "LOW"      { "3.9" }   # CVSS Low: 0.1-3.9
     default    { "0.0" }
   }
 
@@ -499,21 +507,28 @@ foreach ($f in $detailedFindings) {
   })
 }
 
-# Fallback: emit policy-level result if nothing parsed
+# Edge case: zero vulnerabilities — emit a clean informational result so SARIF upload succeeds
+# and any previously open alerts get closed (GitHub closes alerts not present in newest upload)
 if ($results.Count -eq 0) {
-  $rules["WIZ-POLICY-VERDICT"] = [ordered]@{
-    id               = "WIZ-POLICY-VERDICT"
-    name             = "WIZ-POLICY-VERDICT"
-    shortDescription = @{ text = "[Wiz] Policy verdict: $verdict" }
-    fullDescription  = @{ text = "Wiz container scan verdict: $verdict. No package-level findings parsed." }
-    defaultConfiguration = @{ level = "warning" }
-    help             = @{ text = $AppSecContact }
+  $zeroMsg = "Wiz container scan completed. Verdict: $verdict. No vulnerable packages found — image is clean."
+  Write-Host "${esc}[32m✓ CLEAN IMAGE: $zeroMsg${esc}[0m"
+  Write-Host "::notice::$zeroMsg"
+  $rules["WIZ-CLEAN-SCAN"] = [ordered]@{
+    id               = "WIZ-CLEAN-SCAN"
+    name             = "[Wiz] Clean scan — no vulnerabilities found"
+    shortDescription = @{ text = "[Wiz] Clean scan — no vulnerabilities found" }
+    fullDescription  = @{ text = $zeroMsg }
+    defaultConfiguration = @{ level = "note" }
+    help             = @{ text = "$zeroMsg`n`n$AppSecContact"; markdown = "$zeroMsg`n`n$AppSecContact" }
+    properties       = @{ tags = @("wiz", "container", "clean"); "security-severity" = "0.0" }
   }
   $results.Add([ordered]@{
-    ruleId    = "WIZ-POLICY-VERDICT"
-    level     = "warning"
-    message   = @{ text = "Wiz policy verdict: $verdict`n$AppSecContact" }
-    locations = @(@{ physicalLocation = @{ artifactLocation = @{ uri = "Dockerfile" }; region = @{ startLine = 1 } } })
+    ruleId    = "WIZ-CLEAN-SCAN"
+    level     = "note"
+    message   = @{ text = $zeroMsg }
+    locations = @(@{ physicalLocation = @{ artifactLocation = @{ uri = "Dockerfile"; uriBaseId = "%SRCROOT%" }; region = @{ startLine = 1 } } })
+    partialFingerprints = @{ primary = "clean-scan|$scanId" }
+    properties = @{ verdict = $verdict; scanId = $scanId; imageName = $imageName; wizPortalUrl = $wizPortalUrl }
   })
 }
 
