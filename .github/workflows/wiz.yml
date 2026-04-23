@@ -46,7 +46,7 @@ jobs:
             --policies "$POLICY" \
             --client-id  "$WIZ_CLIENT_ID" \
             --client-secret "$WIZ_CLIENT_SECRET" \
-            --output wiz.json,json,true \
+            --json-output-file wiz.json \
             --sarif-output-file wiz.sarif
           echo "Wiz scan exit code: $?"
           ls -lh wiz.json wiz.sarif 2>/dev/null || true
