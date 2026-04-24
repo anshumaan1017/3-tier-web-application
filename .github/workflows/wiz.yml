@@ -1,4 +1,4 @@
-name: Wiz Container Scan + SARIF
+name: Wiz Security Scan (IaC + SCA + Container)
 
 on:
   push:
@@ -13,127 +13,160 @@ jobs:
     permissions:
       contents: read
       security-events: write
+      actions: read
 
     env:
       TAG: 3-tier-web-application:${{ github.sha }}
       POLICY: "Default vulnerabilities policy"
       APPSEC_CONTACT: ${{ vars.APPSEC_CONTACT }}
       GITHUB_RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      COLUMNS: "250"
+      TERM: xterm-256color
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install wizcli
+        run: |
+          curl -fsSL -o wizcli https://downloads.wiz.io/v1/wizcli/latest/wizcli-linux-amd64
+          chmod +x wizcli
+          sudo mv wizcli /usr/local/bin/wizcli
+          wizcli version
+
+      - name: Authenticate Wiz CLI
+        env:
+          WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
+          WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
+        run: wizcli auth --id "$WIZ_CLIENT_ID" --secret "$WIZ_CLIENT_SECRET"
+
+      # ── SCA: source-code dependency scan ─────────────────────────────────
+      - name: Wiz SCA Scan (source dependencies)
+        continue-on-error: true
+        run: |
+          echo "::group::Wiz SCA Scan"
+          wizcli dir scan --path . \
+            --output dir.sarif,sarif,vulnerabilities \
+            --output dir.txt,human,vulnerabilities
+          echo "::endgroup::"
+          echo "::group::SCA findings (raw)"
+          cat dir.txt 2>/dev/null || echo "(no text output)"
+          echo "::endgroup::"
+
+      # ── IaC: Dockerfile misconfiguration scan ────────────────────────────
+      - name: Wiz IaC Scan (Dockerfile)
+        continue-on-error: true
+        run: |
+          echo "::group::Wiz IaC Scan"
+          wizcli iac scan --path ./Dockerfile \
+            --output dockerfile.sarif,sarif,misconfigurations \
+            --output dockerfile.txt,human,misconfigurations
+          echo "::endgroup::"
+          echo "::group::IaC findings (raw)"
+          cat dockerfile.txt 2>/dev/null || echo "(no text output)"
+          echo "::endgroup::"
+
+      # ── Build image ───────────────────────────────────────────────────────
       - name: Build Docker image
         run: |
           docker build . -t "$TAG"
-          echo "Built image: $TAG"
+          echo "Built: $TAG"
 
-      - name: Install wizcli
-        run: |
-          curl -L -o wizcli https://downloads.wiz.io/v1/wizcli/latest/wizcli-linux-amd64
-          chmod +x wizcli
-          ./wizcli version || true
-
-      - name: Run Wiz Container Scan
+      # ── Container scan (per-layer via overlay2 driver) ────────────────────
+      - name: Wiz Container Image Scan (per-layer)
         id: wiz_scan
         continue-on-error: true
         env:
           WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
           WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
         run: |
-          echo "::group::Wiz CLI scan details"
-          echo "Image: $TAG"
-          echo "Policy: $POLICY"
-          echo "Run URL: $GITHUB_RUN_URL"
-          ./wizcli scan container-image "$TAG" \
+          echo "::group::Re-auth as root (required for overlay2 driver)"
+          sudo -E $(which wizcli) auth --id "$WIZ_CLIENT_ID" --secret "$WIZ_CLIENT_SECRET"
+          echo "::endgroup::"
+          echo "::group::Wiz Container Image Scan"
+          echo "Image: $TAG  |  Policy: $POLICY"
+          sudo -E $(which wizcli) docker scan \
+            --image "$TAG" \
             --policies "$POLICY" \
-            --client-id  "$WIZ_CLIENT_ID" \
-            --client-secret "$WIZ_CLIENT_SECRET" \
-            --json-output-file wiz.json \
-            --sarif-output-file wiz.sarif
-          WIZ_EXIT=$?
+            --driver mountWithLayers \
+            --output image.sarif,sarif,vulnerabilities \
+            --output image.txt,human,vulnerabilities \
+            --output image-layers.json,json,vulnerabilities
           echo "::endgroup::"
-          echo "Wiz scan exit code: $WIZ_EXIT"
-          echo "::group::Wiz output files"
-          ls -lh wiz.json wiz.sarif 2>/dev/null || echo "No output files found"
-          echo "wiz.json lines: $(wc -l < wiz.json 2>/dev/null || echo 0)"
+          sudo chown runner:runner image.sarif image.txt image-layers.json 2>/dev/null || true
+          echo "::group::Image findings (raw)"
+          cat image.txt 2>/dev/null || echo "(no text output)"
           echo "::endgroup::"
-          # Quick JSON summary for verbose logs (using jq)
-          if [ -f wiz.json ]; then
-            VERDICT=$(jq -r '.status.verdict // "unknown"' wiz.json 2>/dev/null || echo "unknown")
-            SCAN_ID=$(jq -r '.id // "unknown"' wiz.json 2>/dev/null || echo "unknown")
-            PACKAGES=$(jq -r '(.result.vulnerableSBOMArtifactsByNameVersion // []) | length' wiz.json 2>/dev/null || echo "0")
-            echo "SCAN_ID=$SCAN_ID  VERDICT=$VERDICT  VULNERABLE_PACKAGES=$PACKAGES"
-          fi
+          echo "Output files:"; ls -lh image.sarif image.txt image-layers.json 2>/dev/null || true
 
-      - name: Parse Wiz output and build rich SARIF
+      # ── Enrich SARIFs + print tabular reports ────────────────────────────
+      - name: Enrich SARIFs and print reports
         if: always()
         shell: pwsh
         run: |
           ./scripts/parse_wiz_scan.ps1 `
-            -WizJsonPath         wiz.json `
-            -WizStdoutPath       wiz-stdout.json `
-            -WizSarifPath        wiz.sarif `
-            -OutputSarifPath     wiz-github.sarif `
+            -ImageSarifPath      image.sarif `
+            -ImageLayersPath     image-layers.json `
+            -DirSarifPath        dir.sarif `
+            -DockerfileSarifPath dockerfile.sarif `
             -SummaryMarkdownPath wiz-summary.md `
             -GitHubRunUrl        "${{ env.GITHUB_RUN_URL }}" `
             -AppSecContact       "${{ env.APPSEC_CONTACT }}"
 
       - name: Publish summary to GitHub Job Summary
         if: always()
-        run: |
-          if [ -f wiz-summary.md ]; then
-            cat wiz-summary.md >> "$GITHUB_STEP_SUMMARY"
-          fi
+        run: cat wiz-summary.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
 
-      - name: Upload Wiz parsed outputs as artifact
+      - name: Upload scan artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: wiz-parsed-${{ github.run_id }}
+          name: wiz-scans-${{ github.run_id }}
           retention-days: 14
           if-no-files-found: warn
           path: |
             wiz-summary.md
-            wiz-github.sarif
-            wiz.sarif
-            wiz.json
-            wiz-stdout.json
+            image.sarif
+            dir.sarif
+            dockerfile.sarif
+            image.txt
+            image-layers.json
+            dir.txt
+            dockerfile.txt
 
-      - name: Verify SARIF output exists
-        if: always()
-        run: |
-          if [ ! -f wiz-github.sarif ]; then
-            echo "::error::wiz-github.sarif was not generated — check parser step above"
-            exit 1
-          fi
-          SARIF_SIZE=$(wc -c < wiz-github.sarif)
-          SARIF_RESULTS=$(jq '.runs[0].results | length' wiz-github.sarif 2>/dev/null || echo "parse-error")
-          SARIF_RULES=$(jq '.runs[0].tool.driver.rules | length' wiz-github.sarif 2>/dev/null || echo "parse-error")
-          echo "::notice::SARIF size: ${SARIF_SIZE}B | Rules: ${SARIF_RULES} | Results: ${SARIF_RESULTS}"
-          echo "SARIF file size: ${SARIF_SIZE} bytes"
-          echo "SARIF rules:   ${SARIF_RULES}"
-          echo "SARIF results: ${SARIF_RESULTS}"
-          # Validate SARIF is well-formed JSON
-          jq empty wiz-github.sarif && echo "SARIF JSON valid" || { echo "::error::SARIF is not valid JSON"; exit 1; }
-
-      - name: Upload SARIF to GitHub Security
-        if: always()
-        uses: github/codeql-action/upload-sarif@v4
+      # ── Upload each SARIF with its own category (prevents merging) ────────
+      - name: Upload SCA SARIF
+        if: always() && hashFiles('dir.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
         with:
-          sarif_file: wiz-github.sarif
-          # Fixed category — same category on every run = GitHub OVERWRITES previous results
-          # (existing alerts not in new upload are auto-closed by GitHub)
-          category: wiz-container-scan
+          sarif_file: dir.sarif
+          category: wiz-sca
           wait-for-processing: true
 
+      - name: Upload IaC SARIF
+        if: always() && hashFiles('dockerfile.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: dockerfile.sarif
+          category: wiz-iac
+          wait-for-processing: true
+
+      - name: Upload Image SARIF
+        if: always() && hashFiles('image.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: image.sarif
+          category: wiz-image
+          wait-for-processing: true
+
+      # ── Policy gate ───────────────────────────────────────────────────────
       - name: Enforce Wiz policy gate
         if: always()
         run: |
-          if [ "${{ steps.wiz_scan.outcome }}" = "failure" ]; then
-            echo "::error::Wiz scan step itself failed (not a policy violation — check credentials/network)"
+          outcome="${{ steps.wiz_scan.outcome }}"
+          echo "Wiz container scan outcome: $outcome"
+          if [ "$outcome" = "failure" ]; then
+            echo "::error::Wiz scan step failed (check credentials / network, not a policy violation)"
             exit 1
           fi
-          echo "Wiz scan outcome: ${{ steps.wiz_scan.outcome }}"
-          echo "Policy gate: allowing workflow to proceed (policy violations visible in Security tab)"
+          echo "Policy violations (exit code 4) are visible in the GitHub Security tab."
