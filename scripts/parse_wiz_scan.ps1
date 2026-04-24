@@ -81,7 +81,7 @@ function Set-Prop($obj, [string]$name, $value) {
   if ($obj -is [System.Collections.IDictionary]) {
     $obj[$name] = $value
   } else {
-    $obj | Add-Member -NotePropertyName $name -Value $value -Force
+    $obj | Add-Member -NotePropertyName $name -NotePropertyValue $value -Force
   }
 }
 
@@ -230,7 +230,7 @@ function Enrich-Sarif([object]$sarif, [string]$ScanType = "container") {
         if (-not $res) { continue }
         $sev = Resolve-Sev -result $res -ruleMap $ruleMap
         # Update SARIF level so GitHub Code Scanning colours it correctly
-        $res | Add-Member -NotePropertyName level -Value (Sev-GhaLevel -s $sev) -Force
+        $res | Add-Member -NotePropertyName level -NotePropertyValue (Sev-GhaLevel -s $sev) -Force
         $rid = Safe-Str $res.ruleId ""
         if ($rid) {
           if (-not $ruleSevMap.ContainsKey($rid)) {
@@ -267,7 +267,7 @@ function Enrich-Sarif([object]$sarif, [string]$ScanType = "container") {
 
         # Ensure properties object exists
         if ($null -eq (Get-Prop $r "properties" $null)) {
-          $r | Add-Member -NotePropertyName properties -Value ([PSCustomObject]@{}) -Force
+          $r | Add-Member -NotePropertyName properties -NotePropertyValue ([PSCustomObject]@{}) -Force
         }
 
         # Set security-severity (CVSS score string)
@@ -287,7 +287,7 @@ function Enrich-Sarif([object]$sarif, [string]$ScanType = "container") {
         # rule.name — clean "[Wiz Cloud] CVE-XXXX" identifier (strip any existing [Wiz*] prefix)
         $rawName  = Safe-Str (Get-Prop $r "name" "") $rid
         $baseName = $rawName -replace "^\[Wiz[^\]]*\]\s*", ""
-        $r | Add-Member -NotePropertyName name -Value "[Wiz Cloud] $baseName" -Force
+        $r | Add-Member -NotePropertyName name -NotePropertyValue "[Wiz Cloud] $baseName" -Force
 
         # rule.shortDescription.text — enriched title shown in GitHub Security tab as the alert title
         # Format: "[Wiz Cloud] CVE-XXXX | package installed-version"
@@ -298,12 +298,12 @@ function Enrich-Sarif([object]$sarif, [string]$ScanType = "container") {
         } else { "" }
         $enrichedTitle = "[Wiz Cloud] $baseName$pkgSuffix"
         if ($null -eq $r.shortDescription) {
-          $r | Add-Member -NotePropertyName shortDescription -Value ([PSCustomObject]@{ text = $enrichedTitle }) -Force
+          $r | Add-Member -NotePropertyName shortDescription -NotePropertyValue ([PSCustomObject]@{ text = $enrichedTitle }) -Force
         } else {
-          $r.shortDescription | Add-Member -NotePropertyName text -Value $enrichedTitle -Force
+          $r.shortDescription | Add-Member -NotePropertyName text -NotePropertyValue $enrichedTitle -Force
         }
         if ($null -eq $r.fullDescription) {
-          $r | Add-Member -NotePropertyName fullDescription -Value ([PSCustomObject]@{ text = $enrichedTitle }) -Force
+          $r | Add-Member -NotePropertyName fullDescription -NotePropertyValue ([PSCustomObject]@{ text = $enrichedTitle }) -Force
         }
       }
     }
@@ -311,7 +311,7 @@ function Enrich-Sarif([object]$sarif, [string]$ScanType = "container") {
     # Set tool driver name for differentiation in GitHub Security → Tool filter
     if ($run.tool -and $run.tool.driver) {
       $dName = if ($driverNames.ContainsKey($ScanType)) { $driverNames[$ScanType] } else { "WizCLI" }
-      $run.tool.driver | Add-Member -NotePropertyName name -Value $dName -Force
+      $run.tool.driver | Add-Member -NotePropertyName name -NotePropertyValue $dName -Force
     }
   }
   return $sarif
