@@ -210,9 +210,11 @@ function Resolve-Sev([object]$result, [hashtable]$ruleMap) {
 # SARIF ENRICHMENT — Adds security-severity, tags, [Wiz Cloud] naming
 # Modifies the sarif object in-place; also writes updated levels on results.
 # ═══════════════════════════════════════════════════════════════════════════════
-function Enrich-Sarif([object]$sarif) {
+function Enrich-Sarif([object]$sarif, [string]$ScanType = "container") {
   if (-not $sarif) { return $sarif }
   if (-not $sarif.runs) { return $sarif }
+
+  $driverNames = @{ container = "WizCLI-Container"; sca = "WizCLI-SCA"; iac = "WizCLI-IaC" }
 
   foreach ($run in $sarif.runs) {
     # Build rule lookup
@@ -220,8 +222,9 @@ function Enrich-Sarif([object]$sarif) {
     $rules = Get-Prop $run.tool.driver "rules" $null
     if ($rules) { foreach ($r in $rules) { if ($r -and $r.id) { $ruleMap[[string]$r.id] = $r } } }
 
-    # Pass 1 — resolve severity per result; track highest sev per rule
+    # Pass 1 — resolve severity per result; track highest sev per rule; collect package info
     $ruleSevMap = @{}
+    $rulePkgMap = @{}   # ruleId → {pkg, ver} — used for enriched GitHub Security alert titles
     if ($run.results) {
       foreach ($res in $run.results) {
         if (-not $res) { continue }
@@ -229,12 +232,27 @@ function Enrich-Sarif([object]$sarif) {
         # Update SARIF level so GitHub Code Scanning colours it correctly
         $res | Add-Member -NotePropertyName level -Value (Sev-GhaLevel -s $sev) -Force
         $rid = Safe-Str $res.ruleId ""
-        if ($rid -and -not $ruleSevMap.ContainsKey($rid)) {
-          $ruleSevMap[$rid] = $sev
-        } elseif ($rid -and $ruleSevMap.ContainsKey($rid)) {
-          # Keep highest severity seen for this rule
-          if ((Sev-Rank $sev) -lt (Sev-Rank $ruleSevMap[$rid])) {
+        if ($rid) {
+          if (-not $ruleSevMap.ContainsKey($rid)) {
             $ruleSevMap[$rid] = $sev
+          } elseif ((Sev-Rank $sev) -lt (Sev-Rank $ruleSevMap[$rid])) {
+            $ruleSevMap[$rid] = $sev
+          }
+          # Collect first-seen package/component info for enriched alert titles
+          if (-not $rulePkgMap.ContainsKey($rid)) {
+            $msgText = Safe-Str (Get-Prop $res.message "text" "") ""
+            $f = Parse-MsgText -text $msgText
+            $pkg = Safe-Str $f["package"] ""
+            if ($pkg -match "^(.+?)\s*\(") { $pkg = $Matches[1].Trim() }
+            if (-not $pkg) { $pkg = Safe-Str $f["component"] "" }
+            if (-not $pkg) { $pkg = Safe-Str $f["library"] "" }
+            $ver = Safe-Str $f["installed version"] ""
+            if (-not $ver) { $ver = Safe-Str $f["version"] "" }
+            if (-not $ver) {
+              $pkgRaw = Safe-Str $f["package"] ""
+              if ($pkgRaw -match "\(([^)]+)\)$") { $ver = $Matches[1].Trim() }
+            }
+            if ($pkg) { $rulePkgMap[$rid] = @{ pkg = $pkg; ver = $ver } }
           }
         }
       }
@@ -266,19 +284,34 @@ function Enrich-Sarif([object]$sarif) {
         # Also stamp the resolved severity string
         Set-Prop $r.properties "severity" $sev
 
-        # Rename rule: [Wiz] prefix → [Wiz Cloud]; bare names get prefixed
-        $curName = Safe-Str (Get-Prop $r "name" "") $rid
-        $newName = if     ($curName -match "^\[Wiz\]\s*")    { $curName -replace "^\[Wiz\]\s*", "[Wiz Cloud] " }
-                   elseif ($curName -match "^\[Wiz Cloud\]")  { $curName }
-                   else                                        { "[Wiz Cloud] $curName" }
-        $r | Add-Member -NotePropertyName name -Value $newName -Force
+        # rule.name — clean "[Wiz Cloud] CVE-XXXX" identifier (strip any existing [Wiz*] prefix)
+        $rawName  = Safe-Str (Get-Prop $r "name" "") $rid
+        $baseName = $rawName -replace "^\[Wiz[^\]]*\]\s*", ""
+        $r | Add-Member -NotePropertyName name -Value "[Wiz Cloud] $baseName" -Force
 
-        # Sync shortDescription
-        if ($r.shortDescription -and $r.shortDescription.text) {
-          $newText = ([string]$r.shortDescription.text) -replace "^\[Wiz\]\s*", "[Wiz Cloud] "
-          $r.shortDescription | Add-Member -NotePropertyName text -Value $newText -Force
+        # rule.shortDescription.text — enriched title shown in GitHub Security tab as the alert title
+        # Format: "[Wiz Cloud] CVE-XXXX | package installed-version"
+        $pkgInfo   = if ($rulePkgMap.ContainsKey($rid)) { $rulePkgMap[$rid] } else { $null }
+        $pkgSuffix = if ($pkgInfo -and $pkgInfo.pkg) {
+          $vs = if ($pkgInfo.ver) { " $($pkgInfo.ver)" } else { "" }
+          " | $($pkgInfo.pkg)$vs"
+        } else { "" }
+        $enrichedTitle = "[Wiz Cloud] $baseName$pkgSuffix"
+        if ($null -eq $r.shortDescription) {
+          $r | Add-Member -NotePropertyName shortDescription -Value ([PSCustomObject]@{ text = $enrichedTitle }) -Force
+        } else {
+          $r.shortDescription | Add-Member -NotePropertyName text -Value $enrichedTitle -Force
+        }
+        if ($null -eq $r.fullDescription) {
+          $r | Add-Member -NotePropertyName fullDescription -Value ([PSCustomObject]@{ text = $enrichedTitle }) -Force
         }
       }
+    }
+
+    # Set tool driver name for differentiation in GitHub Security → Tool filter
+    if ($run.tool -and $run.tool.driver) {
+      $dName = if ($driverNames.ContainsKey($ScanType)) { $driverNames[$ScanType] } else { "WizCLI" }
+      $run.tool.driver | Add-Member -NotePropertyName name -Value $dName -Force
     }
   }
   return $sarif
@@ -470,7 +503,7 @@ $containerRows = @()
 if ($imageSarif) {
   Write-Host ""
   Write-Host "::group::Enriching image.sarif (Container Vulnerabilities)"
-  $imageSarif = Enrich-Sarif -sarif $imageSarif
+  $imageSarif = Enrich-Sarif -sarif $imageSarif -ScanType "container"
   $imageSarif | ConvertTo-Json -Depth 100 -Compress | Set-Content -LiteralPath $ImageSarifPath -Encoding utf8NoBOM
   Write-Host "  ✔ image.sarif enriched and written back."
   Write-Host "::endgroup::"
@@ -558,6 +591,32 @@ if ($layerJson) {
   Write-Host "  Layers with vulnerabilities: $($layerGroups.Count)"
   Write-Host "::endgroup::"
 
+  # ── Cross-layer CVE deduplication ────────────────────────────────────────────
+  # Base image CVEs propagate to every subsequent layer in the Wiz per-layer scan.
+  # We only show a CVE at the FIRST layer (lowest index) that introduces it, so
+  # each vulnerability appears exactly once in the report.
+  $globalFirstLid = @{}   # "pkg|cve" → digest of the layer that introduces it
+  foreach ($entry in ($layerGroups.GetEnumerator() | Sort-Object { [int]$_.Value.index })) {
+    $lid = $entry.Key
+    foreach ($lf in $entry.Value.findings) {
+      $k = "$($lf.pkg)|$($lf.cve)"
+      if (-not $globalFirstLid.ContainsKey($k)) { $globalFirstLid[$k] = $lid }
+    }
+  }
+  # Rebuild each layer's findings keeping only CVEs introduced by that layer
+  foreach ($lid in @($layerGroups.Keys)) {
+    $seenInLayer = @{}
+    $newFinds    = [System.Collections.Generic.List[object]]::new()
+    foreach ($lf in ($layerGroups[$lid]['findings'] | Sort-Object { Sev-Rank $_.sev })) {
+      $k = "$($lf.pkg)|$($lf.cve)"
+      if ($globalFirstLid[$k] -eq $lid -and -not $seenInLayer.ContainsKey($k)) {
+        $seenInLayer[$k] = 1
+        $newFinds.Add($lf)
+      }
+    }
+    $layerGroups[$lid]['findings'] = $newFinds
+  }
+
   if ($layerGroups.Count -gt 0) {
     Write-Host ""
     Write-Host "::group::Per-Layer Vulnerability Report ($($layerGroups.Count) layers with findings)"
@@ -573,6 +632,9 @@ if ($layerJson) {
       $lid    = $entry.Key
       $lpay   = $entry.Value
       $lfinds = @($lpay.findings)
+
+      # Skip layers where all CVEs were inherited from an earlier layer
+      if ($lfinds.Count -eq 0) { continue }
 
       $lc = @($lfinds | Where-Object { $_.sev -eq "CRITICAL" }).Count
       $lh = @($lfinds | Where-Object { $_.sev -eq "HIGH" }).Count
@@ -630,7 +692,7 @@ $scaRows  = @()
 if ($scaSarif) {
   Write-Host ""
   Write-Host "::group::Enriching dir.sarif (SCA — Source Dependencies)"
-  $scaSarif = Enrich-Sarif -sarif $scaSarif
+  $scaSarif = Enrich-Sarif -sarif $scaSarif -ScanType "sca"
   $scaSarif | ConvertTo-Json -Depth 100 -Compress | Set-Content -LiteralPath $DirSarifPath -Encoding utf8NoBOM
   Write-Host "  ✔ dir.sarif enriched and written back."
   Write-Host "::endgroup::"
@@ -649,7 +711,7 @@ $iacRows  = @()
 if ($iacSarif) {
   Write-Host ""
   Write-Host "::group::Enriching dockerfile.sarif (IaC — Dockerfile Misconfigurations)"
-  $iacSarif = Enrich-Sarif -sarif $iacSarif
+  $iacSarif = Enrich-Sarif -sarif $iacSarif -ScanType "iac"
   $iacSarif | ConvertTo-Json -Depth 100 -Compress | Set-Content -LiteralPath $DockerfileSarifPath -Encoding utf8NoBOM
   Write-Host "  ✔ dockerfile.sarif enriched and written back."
   Write-Host "::endgroup::"
@@ -735,6 +797,7 @@ if ($layerGroups.Count -gt 0) {
     $lid    = $entry.Key
     $lpay   = $entry.Value
     $lfinds = @($lpay.findings)
+    if ($lfinds.Count -eq 0) { continue }   # skip layers with only inherited CVEs
     $lc = @($lfinds | Where-Object { $_.sev -eq "CRITICAL" }).Count
     $lh = @($lfinds | Where-Object { $_.sev -eq "HIGH" }).Count
     $lm = @($lfinds | Where-Object { $_.sev -eq "MEDIUM" }).Count

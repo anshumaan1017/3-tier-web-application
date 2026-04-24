@@ -216,7 +216,8 @@ jobs:
           Write-Host "::group::Input file inventory"
           @("image.sarif","image-layers.json","dir.sarif","dockerfile.sarif") | ForEach-Object {
             $exists = Test-Path -LiteralPath $_
-            Write-Host ("  {0,-30} {1}" -f $_, (if ($exists) { "FOUND" } else { "NOT FOUND — skipping" }))
+            $status = $exists ? "FOUND" : "NOT FOUND — skipping"
+            Write-Host ("  {0,-30} {1}" -f $_, $status)
           }
           Write-Host "::endgroup::"
 
