@@ -61,7 +61,7 @@ function Get-Json([string]$Path) {
 function Safe-Str($v, [string]$default = "") {
   if ($null -eq $v) { return $default }
   $s = [string]$v
-  return if ([string]::IsNullOrWhiteSpace($s)) { $default } else { $s.Trim() }
+  return [string]::IsNullOrWhiteSpace($s) ? $default : $s.Trim()
 }
 
 function Safe-Int($v) {
@@ -88,10 +88,10 @@ function Set-Prop($obj, [string]$name, $value) {
 function Get-Prop($obj, [string]$name, $default = $null) {
   if ($null -eq $obj) { return $default }
   if ($obj -is [System.Collections.IDictionary]) {
-    return if ($obj.Contains($name)) { $obj[$name] } else { $default }
+    return $obj.Contains($name) ? $obj[$name] : $default
   }
   $p = $obj.PSObject.Properties[$name]
-  return if ($null -ne $p) { $p.Value } else { $default }
+  return ($null -ne $p) ? $p.Value : $default
 }
 
 function Sev-Color([string]$s) {
@@ -129,7 +129,7 @@ function Sev-Rank([string]$s) {
   # Null-safe sort key
   $k = [string]$s
   $v = $script:sevOrd[$k]
-  return if ($null -ne $v) { [int]$v } else { 99 }
+  return ($null -ne $v) ? [int]$v : 99
 }
 
 # ── Parse "Key: value" lines from Wiz SARIF message.text ──────────────────────
