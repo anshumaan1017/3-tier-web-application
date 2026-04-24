@@ -1,7 +1,21 @@
 <#
 .SYNOPSIS
-  Unified Wiz scan enricher — Container + Per-Layer + SCA + IaC.
-  Produces: colorized tabular CI logs, enriched SARIF files, GitHub Job Summary markdown.
+  Unified Wiz security scan enricher — Container Image + Per-Layer + SCA + IaC.
+  Produces: ANSI-colored tabular CI logs, enriched SARIF files, GitHub Job Summary markdown.
+
+.DESCRIPTION
+  Input files (all optional — missing files are skipped gracefully):
+    image.sarif        — Wiz container image vulnerability SARIF
+    image-layers.json  — Wiz per-layer vulnerability JSON (from --driver mountWithLayers)
+    dir.sarif          — Wiz SCA source-dependency vulnerability SARIF
+    dockerfile.sarif   — Wiz IaC Dockerfile misconfiguration SARIF
+
+  Output files:
+    wiz-summary.md     — GitHub Job Summary markdown (all 4 scan types)
+    Each SARIF is enriched in-place with security-severity CVSS scores.
+
+  CVSS thresholds (per org spec):
+    CRITICAL=9.5  HIGH=8.0  MEDIUM=5.5  LOW=3.0  INFORMATIONAL=0.5  UNKNOWN=0.0
 #>
 param(
   [string]$ImageSarifPath       = "image.sarif",
@@ -19,22 +33,35 @@ if ([string]::IsNullOrWhiteSpace($AppSecContact)) {
   $AppSecContact = "appsec@devsecopswithanshu.com"
 }
 
-$esc       = [char]27
-$sevOrder  = @{ CRITICAL=0; HIGH=1; MEDIUM=2; LOW=3; INFORMATIONAL=4; INFO=4; UNKNOWN=5 }
-$validSevs = @("CRITICAL","HIGH","MEDIUM","LOW","INFORMATIONAL")
+$esc        = [char]27
+$validSevs  = [System.Collections.Generic.HashSet[string]]@("CRITICAL","HIGH","MEDIUM","LOW","INFORMATIONAL")
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# Script-level severity order for Sort-Object closures (must use $script: prefix inside scriptblocks)
+$script:sevOrd = @{ CRITICAL=0; HIGH=1; MEDIUM=2; LOW=3; INFORMATIONAL=4; INFO=4; UNKNOWN=5 }
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HELPER FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
 function Get-Json([string]$Path) {
-  if (-not (Test-Path -LiteralPath $Path)) { return $null }
-  try { return (Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -Depth 100) }
-  catch { Write-Host "[WARN] Cannot parse JSON: $Path ($($_.Exception.Message))"; return $null }
+  if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) {
+    return $null
+  }
+  try {
+    $raw = Get-Content -LiteralPath $Path -Raw -Encoding utf8
+    if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
+    return ($raw | ConvertFrom-Json -Depth 100)
+  }
+  catch {
+    Write-Host "[WARN] Cannot parse JSON: $Path — $($_.Exception.Message)"
+    return $null
+  }
 }
 
-function Safe-Str($v, [string]$d = "") {
-  if ($null -eq $v) { return $d }
+function Safe-Str($v, [string]$default = "") {
+  if ($null -eq $v) { return $default }
   $s = [string]$v
-  if ([string]::IsNullOrWhiteSpace($s)) { return $d }
-  return $s.Trim()
+  return if ([string]::IsNullOrWhiteSpace($s)) { $default } else { $s.Trim() }
 }
 
 function Safe-Int($v) {
@@ -44,31 +71,50 @@ function Safe-Int($v) {
 
 function Trunc([string]$s, [int]$max) {
   if (-not $s) { return "" }
-  if ($s.Length -gt $max) { return $s.Substring(0, [Math]::Max(0,$max-1)) + [char]0x2026 }
-  return $s
+  if ($s.Length -le $max) { return $s }
+  return $s.Substring(0, [Math]::Max(0, $max - 1)) + [char]0x2026
+}
+
+# Get or set a property on PSCustomObject OR IDictionary (OrderedDictionary) safely
+function Set-Prop($obj, [string]$name, $value) {
+  if ($null -eq $obj) { return }
+  if ($obj -is [System.Collections.IDictionary]) {
+    $obj[$name] = $value
+  } else {
+    $obj | Add-Member -NotePropertyName $name -Value $value -Force
+  }
+}
+
+function Get-Prop($obj, [string]$name, $default = $null) {
+  if ($null -eq $obj) { return $default }
+  if ($obj -is [System.Collections.IDictionary]) {
+    return if ($obj.Contains($name)) { $obj[$name] } else { $default }
+  }
+  $p = $obj.PSObject.Properties[$name]
+  return if ($null -ne $p) { $p.Value } else { $default }
 }
 
 function Sev-Color([string]$s) {
   switch ($s.ToUpper()) {
-    "CRITICAL" { return "1;37;41" }
-    "HIGH"     { return "1;31" }
-    "MEDIUM"   { return "1;33" }
-    "LOW"      { return "1;32" }
-    default    { return "0" }
+    "CRITICAL" { return "1;37;41"  }   # white on red
+    "HIGH"     { return "1;31"     }   # bold red
+    "MEDIUM"   { return "1;33"     }   # bold yellow
+    "LOW"      { return "1;32"     }   # bold green
+    default    { return "0;37"     }   # grey
   }
 }
 
-function Sev-Level([string]$s) {
+function Sev-GhaLevel([string]$s) {
   switch ($s.ToUpper()) {
-    "CRITICAL" { return "error" }
-    "HIGH"     { return "error" }
+    "CRITICAL" { return "error"   }
+    "HIGH"     { return "error"   }
     "MEDIUM"   { return "warning" }
-    default    { return "note" }
+    default    { return "note"    }
   }
 }
 
-# CVSS security-severity thresholds per spec
 function Sec-Sev([string]$s) {
+  # Org-defined CVSS thresholds
   switch ($s.ToUpper()) {
     "CRITICAL"      { return "9.5" }
     "HIGH"          { return "8.0" }
@@ -79,65 +125,77 @@ function Sec-Sev([string]$s) {
   }
 }
 
-# Parse "Key: value" pairs from Wiz SARIF message.text
+function Sev-Rank([string]$s) {
+  # Null-safe sort key
+  $k = [string]$s
+  $v = $script:sevOrd[$k]
+  return if ($null -ne $v) { [int]$v } else { 99 }
+}
+
+# ── Parse "Key: value" lines from Wiz SARIF message.text ──────────────────────
+# Handles Wiz formats:
+#   Package: openssl (1.1.1k)       Installed Version: 1.1.1k    Fixed Version: 1.1.1l
+#   CVE: CVE-2023-1234              Severity: HIGH               Description: ...
+#   Rule: WIZ-IAC-001               Resource: ./Dockerfile
 function Parse-MsgText([string]$text) {
   $f = [ordered]@{}
   if (-not $text) { return $f }
   foreach ($line in ($text -split "`n")) {
-    if ($line -match "^([A-Za-z /]+):\s*(.+)$") {
+    $line = $line.TrimEnd("`r")
+    # Key: alphanumeric+space+/- starting with letter, at most 60 chars
+    if ($line -match "^([A-Za-z][A-Za-z0-9 /\-\.]{0,58}):\s*(.*)$") {
       $k = $Matches[1].Trim().ToLower()
       $v = $Matches[2].Trim()
       if (-not $f.Contains($k)) { $f[$k] = $v }
     }
   }
+  # Multi-line description: grab everything after "Description:" label
   $di = $text.IndexOf("Description:")
-  if ($di -ge 0) { $f["description"] = $text.Substring($di + 12).Trim().Split("`n")[0] }
+  if ($di -ge 0) {
+    $descFull = $text.Substring($di + 12).Trim()
+    # Only first line for display
+    $f["description"] = ($descFull -split "`n")[0].TrimEnd("`r").Trim()
+  }
   return $f
 }
 
-# Resolve severity from a SARIF result using multi-source fallback
-function Get-ResultSeverity([object]$result, [hashtable]$ruleMap) {
-  $msgText = ""
-  if ($result.message -and $result.message.text) { $msgText = [string]$result.message.text }
-  $fields = Parse-MsgText -text $msgText
+# ── Multi-source severity resolution ─────────────────────────────────────────
+function Resolve-Sev([object]$result, [hashtable]$ruleMap) {
+  $msgText = Safe-Str (Get-Prop $result.message "text" "") ""
+  $fields  = Parse-MsgText -text $msgText
 
-  # 1. message.text "Severity: X"
+  # Source 1 — message.text "Severity: X" (most explicit)
   $sev = Safe-Str $fields["severity"] ""
-  if ($sev -and $sev.ToUpper() -in $validSevs) { return $sev.ToUpper() }
+  if ($sev -and $validSevs.Contains($sev.ToUpper())) { return $sev.ToUpper() }
 
-  # 2. result.properties.severity
-  if ($result.properties -and $result.properties.severity) {
-    $ps = ([string]$result.properties.severity).ToUpper()
-    if ($ps -in $validSevs) { return $ps }
-  }
+  # Source 2 — result.properties.severity (Wiz primary field)
+  $ps = Safe-Str (Get-Prop $result.properties "severity" "") ""
+  if ($ps -and $validSevs.Contains($ps.ToUpper())) { return $ps.ToUpper() }
 
-  # 3. rule.properties.severity / security-severity
-  $rid = ""; if ($result.ruleId) { $rid = [string]$result.ruleId }
-  $rule = $null
-  if ($rid -and $ruleMap.ContainsKey($rid)) { $rule = $ruleMap[$rid] }
+  # Source 3 — rule.properties.severity / security-severity
+  $rid  = Safe-Str $result.ruleId ""
+  $rule = if ($rid -and $ruleMap.ContainsKey($rid)) { $ruleMap[$rid] } else { $null }
   if ($rule -and $rule.properties) {
-    if ($rule.properties.severity) {
-      $rs = ([string]$rule.properties.severity).ToUpper()
-      if ($rs -in $validSevs) { return $rs }
-    }
-    $ss = $rule.properties."security-severity"
+    $rs = Safe-Str (Get-Prop $rule.properties "severity" "") ""
+    if ($rs -and $validSevs.Contains($rs.ToUpper())) { return $rs.ToUpper() }
+
+    $ss = Safe-Str (Get-Prop $rule.properties "security-severity" "") ""
     if ($ss) {
       $score = [double]0
-      if ([double]::TryParse([string]$ss, [ref]$score)) {
+      if ([double]::TryParse($ss, [System.Globalization.NumberStyles]::Any, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$score)) {
         if     ($score -ge 9.0) { return "CRITICAL" }
         elseif ($score -ge 7.0) { return "HIGH" }
         elseif ($score -ge 4.0) { return "MEDIUM" }
-        elseif ($score -gt 0)   { return "LOW" }
+        elseif ($score -gt 0.0) { return "LOW" }
         else                    { return "INFORMATIONAL" }
       }
     }
   }
 
-  # 4. SARIF level fallback
-  $lvl = ""
-  if ($result.level) { $lvl = [string]$result.level }
-  elseif ($rule -and $rule.defaultConfiguration -and $rule.defaultConfiguration.level) {
-    $lvl = [string]$rule.defaultConfiguration.level
+  # Source 4 — SARIF result.level / rule.defaultConfiguration.level
+  $lvl = Safe-Str $result.level ""
+  if (-not $lvl -and $rule -and $rule.defaultConfiguration) {
+    $lvl = Safe-Str $rule.defaultConfiguration.level ""
   }
   switch ($lvl.ToLower()) {
     "error"   { return "HIGH" }
@@ -148,107 +206,174 @@ function Get-ResultSeverity([object]$result, [hashtable]$ruleMap) {
   return "UNKNOWN"
 }
 
-# Add security-severity to rules, rename to [Wiz Cloud], fix result levels
+# ═══════════════════════════════════════════════════════════════════════════════
+# SARIF ENRICHMENT — Adds security-severity, tags, [Wiz Cloud] naming
+# Modifies the sarif object in-place; also writes updated levels on results.
+# ═══════════════════════════════════════════════════════════════════════════════
 function Enrich-Sarif([object]$sarif) {
   if (-not $sarif) { return $sarif }
+  if (-not $sarif.runs) { return $sarif }
 
-  $ruleMap = @{}
   foreach ($run in $sarif.runs) {
-    $rules = $run.tool.driver.rules
-    if ($rules) { foreach ($r in $rules) { if ($r.id) { $ruleMap[[string]$r.id] = $r } } }
-  }
+    # Build rule lookup
+    $ruleMap = @{}
+    $rules = Get-Prop $run.tool.driver "rules" $null
+    if ($rules) { foreach ($r in $rules) { if ($r -and $r.id) { $ruleMap[[string]$r.id] = $r } } }
 
-  # First pass: resolve severity per result, update levels
-  $ruleSevMap = @{}
-  foreach ($run in $sarif.runs) {
-    foreach ($res in $run.results) {
-      if (-not $res) { continue }
-      $rid = ""; if ($res.ruleId) { $rid = [string]$res.ruleId }
-      $sev = Get-ResultSeverity -result $res -ruleMap $ruleMap
-      $res.level = Sev-Level -s $sev
-      if ($rid -and -not $ruleSevMap.ContainsKey($rid)) { $ruleSevMap[$rid] = $sev }
+    # Pass 1 — resolve severity per result; track highest sev per rule
+    $ruleSevMap = @{}
+    if ($run.results) {
+      foreach ($res in $run.results) {
+        if (-not $res) { continue }
+        $sev = Resolve-Sev -result $res -ruleMap $ruleMap
+        # Update SARIF level so GitHub Code Scanning colours it correctly
+        $res | Add-Member -NotePropertyName level -Value (Sev-GhaLevel -s $sev) -Force
+        $rid = Safe-Str $res.ruleId ""
+        if ($rid -and -not $ruleSevMap.ContainsKey($rid)) {
+          $ruleSevMap[$rid] = $sev
+        } elseif ($rid -and $ruleSevMap.ContainsKey($rid)) {
+          # Keep highest severity seen for this rule
+          if ((Sev-Rank $sev) -lt (Sev-Rank $ruleSevMap[$rid])) {
+            $ruleSevMap[$rid] = $sev
+          }
+        }
+      }
     }
-  }
 
-  # Second pass: enrich rules
-  foreach ($run in $sarif.runs) {
-    $rules = $run.tool.driver.rules
-    if (-not $rules) { continue }
-    foreach ($r in $rules) {
-      $rid = ""; if ($r.id) { $rid = [string]$r.id }
-      if (-not $rid) { continue }
-      $sev = if ($ruleSevMap.ContainsKey($rid)) { $ruleSevMap[$rid] } else { "UNKNOWN" }
+    # Pass 2 — enrich rules with security-severity, tags, [Wiz Cloud] naming
+    if ($rules) {
+      foreach ($r in $rules) {
+        if (-not $r -or -not $r.id) { continue }
+        $rid = [string]$r.id
+        $sev = if ($ruleSevMap.ContainsKey($rid)) { $ruleSevMap[$rid] } else { "UNKNOWN" }
 
-      if (-not $r.properties) {
-        $r | Add-Member -NotePropertyName properties -Value ([ordered]@{}) -Force
-      }
-      $r.properties."security-severity" = Sec-Sev -s $sev
+        # Ensure properties object exists
+        if ($null -eq (Get-Prop $r "properties" $null)) {
+          $r | Add-Member -NotePropertyName properties -Value ([PSCustomObject]@{}) -Force
+        }
 
-      $tags = @(); if ($r.properties.tags) { $tags = @($r.properties.tags) }
-      if ($tags -notcontains "security") { $tags += "security" }
-      if ($tags -notcontains "wiz")      { $tags += "wiz" }
-      $r.properties.tags = $tags
+        # Set security-severity (CVSS score string)
+        Set-Prop $r.properties "security-severity" (Sec-Sev -s $sev)
 
-      # Rename: [Wiz] -> [Wiz Cloud], or prefix if not already tagged
-      $currentName = Safe-Str $r.name $rid
-      if ($currentName -match "^\[Wiz\]") {
-        $r.name = $currentName -replace "^\[Wiz\]", "[Wiz Cloud]"
-      } elseif ($currentName -notmatch "^\[Wiz") {
-        $r.name = "[Wiz Cloud] $currentName"
-      }
-      if ($r.shortDescription -and $r.shortDescription.text) {
-        $r.shortDescription.text = ([string]$r.shortDescription.text) -replace "^\[Wiz\]","[Wiz Cloud]"
+        # Maintain tags array
+        $existingTags = @()
+        $rawTags = Get-Prop $r.properties "tags" $null
+        if ($rawTags) { $existingTags = @($rawTags) }
+        if ($existingTags -notcontains "security") { $existingTags += "security" }
+        if ($existingTags -notcontains "wiz")      { $existingTags += "wiz" }
+        Set-Prop $r.properties "tags" $existingTags
+
+        # Also stamp the resolved severity string
+        Set-Prop $r.properties "severity" $sev
+
+        # Rename rule: [Wiz] prefix → [Wiz Cloud]; bare names get prefixed
+        $curName = Safe-Str (Get-Prop $r "name" "") $rid
+        $newName = if     ($curName -match "^\[Wiz\]\s*")    { $curName -replace "^\[Wiz\]\s*", "[Wiz Cloud] " }
+                   elseif ($curName -match "^\[Wiz Cloud\]")  { $curName }
+                   else                                        { "[Wiz Cloud] $curName" }
+        $r | Add-Member -NotePropertyName name -Value $newName -Force
+
+        # Sync shortDescription
+        if ($r.shortDescription -and $r.shortDescription.text) {
+          $newText = ([string]$r.shortDescription.text) -replace "^\[Wiz\]\s*", "[Wiz Cloud] "
+          $r.shortDescription | Add-Member -NotePropertyName text -Value $newText -Force
+        }
       }
     }
   }
   return $sarif
 }
 
-# Extract display rows from a SARIF object for tabular output
+# ═══════════════════════════════════════════════════════════════════════════════
+# ROW EXTRACTION — Converts SARIF into display rows for tables
+# ═══════════════════════════════════════════════════════════════════════════════
 function Get-SarifRows([object]$sarif) {
   $rows = [System.Collections.Generic.List[object]]::new()
-  if (-not $sarif) { return $rows }
-
-  $ruleMap = @{}
-  foreach ($run in $sarif.runs) {
-    $rules = $run.tool.driver.rules
-    if ($rules) { foreach ($r in $rules) { if ($r.id) { $ruleMap[[string]$r.id] = $r } } }
-  }
+  if (-not $sarif -or -not $sarif.runs) { return $rows }
 
   foreach ($run in $sarif.runs) {
+    $ruleMap = @{}
+    $rules = Get-Prop $run.tool.driver "rules" $null
+    if ($rules) { foreach ($r in $rules) { if ($r -and $r.id) { $ruleMap[[string]$r.id] = $r } } }
+
+    if (-not $run.results) { continue }
     foreach ($res in $run.results) {
       if (-not $res) { continue }
+
       $rid  = Safe-Str $res.ruleId "N/A"
-      $sev  = Get-ResultSeverity -result $res -ruleMap $ruleMap
+      $sev  = Resolve-Sev -result $res -ruleMap $ruleMap
       $rule = if ($ruleMap.ContainsKey($rid)) { $ruleMap[$rid] } else { $null }
 
-      $msgText = ""
-      if ($res.message -and $res.message.text) { $msgText = [string]$res.message.text }
-      $fields = Parse-MsgText -text $msgText
+      # ── Message text field extraction ────────────────────────────────────
+      $msgText = Safe-Str (Get-Prop $res.message "text" "") ""
+      $f       = Parse-MsgText -text $msgText
 
-      $component = Safe-Str $fields["component"] ""
-      if (-not $component -and $rule -and $rule.name) { $component = ([string]$rule.name) -replace "^\[Wiz[^\]]*\]\s*","" }
+      # Component: check "component", then "package" (Wiz container format)
+      $component = Safe-Str $f["component"] ""
+      if (-not $component) {
+        $pkg = Safe-Str $f["package"] ""
+        if ($pkg) {
+          # Wiz format: "openssl (1.1.1k)" — strip version in parens
+          $component = if ($pkg -match "^(.+?)\s*\(") { $Matches[1].Trim() } else { $pkg }
+        }
+      }
+      if (-not $component) {
+        # IaC: try "resource" field
+        $component = Safe-Str $f["resource"] ""
+      }
+      if (-not $component -and $rule -and $rule.name) {
+        $component = ([string]$rule.name) -replace "^\[Wiz[^\]]*\]\s*", ""
+      }
       if (-not $component) { $component = "N/A" }
 
-      $version = Safe-Str $fields["version"] "N/A"
-      $fixed   = Safe-Str $fields["fixed version"] "N/A"
-      $cveRule = Safe-Str $fields["cve / rule"] $rid
-      $rem     = Safe-Str $fields["remediation"] ""
-      $desc    = Safe-Str $fields["description"] ""
+      # Version: check "version", then "installed version" (Wiz container format)
+      $version = Safe-Str $f["version"] ""
+      if (-not $version) { $version = Safe-Str $f["installed version"] "" }
+      # Also try to extract from "Package: name (ver)" parenthesised format
+      if (-not $version) {
+        $pkg = Safe-Str $f["package"] ""
+        if ($pkg -match "\(([^)]+)\)$") { $version = $Matches[1].Trim() }
+      }
+      if (-not $version) { $version = "N/A" }
+
+      # Fixed version: check both "fixed version" and "fix"
+      $fixed = Safe-Str $f["fixed version"] ""
+      if (-not $fixed) { $fixed = Safe-Str $f["fix"] "" }
+      if (-not $fixed) { $fixed = Safe-Str $f["fixedversion"] "" }
+      if (-not $fixed) { $fixed = "N/A" }
+
+      # CVE / rule display: check "cve", "vulnerability", then fall back to ruleId
+      $cveId = Safe-Str $f["cve"] ""
+      if (-not $cveId) { $cveId = Safe-Str $f["vulnerability"] "" }
+      if (-not $cveId) { $cveId = Safe-Str $f["rule"] "" }
+      if (-not $cveId) { $cveId = $rid }
+
+      # Description
+      $desc = Safe-Str $f["description"] ""
       if (-not $desc -and $rule -and $rule.shortDescription -and $rule.shortDescription.text) {
-        $desc = ([string]$rule.shortDescription.text) -replace "^\[Wiz[^\]]*\]\s*",""
+        $desc = ([string]$rule.shortDescription.text) -replace "^\[Wiz[^\]]*\]\s*", ""
       }
-      if (-not $desc) { $desc = ($msgText -split "`n")[0] }
+      if (-not $desc -and $msgText) { $desc = ($msgText -split "`n")[0].Trim() }
 
-      # For long UUID-style ruleIds (IaC), prefer the human-readable rule name
+      # Remediation
+      $rem = Safe-Str $f["remediation"] ""
+
+      # Display rule: use human-readable name for long UUID IaC rules
       $displayRule = $rid
-      if ($rule -and $rule.name -and $rid.Length -gt 32 -and $rid -match "^[0-9a-f-]{30,}$") {
-        $displayRule = ([string]$rule.name) -replace "^\[Wiz[^\]]*\]\s*",""
+      if ($rule -and $rule.name) {
+        $rName = ([string]$rule.name) -replace "^\[Wiz[^\]]*\]\s*", ""
+        # Use human name when ruleId is a UUID (IaC) or very long opaque string
+        if ($rid -match "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$") {
+          $displayRule = $rName
+        } elseif ($rid -match "^CVE-\d{4}-\d+$") {
+          $displayRule = $rid  # Keep CVE IDs as-is
+        }
       }
 
+      # File / location
       $filePath = "N/A"
-      if ($res.locations -and $res.locations.Count -gt 0) {
-        $loc = $res.locations[0]
+      if ($res.locations -and @($res.locations).Count -gt 0) {
+        $loc = @($res.locations)[0]
         if ($loc -and $loc.physicalLocation -and $loc.physicalLocation.artifactLocation) {
           $uri = $loc.physicalLocation.artifactLocation.uri
           if ($uri) { $filePath = [string]$uri }
@@ -258,7 +383,7 @@ function Get-SarifRows([object]$sarif) {
       $rows.Add([ordered]@{
         ruleId      = $rid
         displayRule = $displayRule
-        cveRule     = $cveRule
+        cveId       = $cveId
         severity    = $sev
         component   = $component
         version     = $version
@@ -269,95 +394,143 @@ function Get-SarifRows([object]$sarif) {
       })
     }
   }
-  return ($rows | Sort-Object { $sevOrder[[string]$_.severity] })
+
+  return ($rows | Sort-Object { Sev-Rank $_.severity })
 }
 
-# Print a colored section table to stdout
-function Print-Section([string]$title, $rows) {
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONSOLE TABLE PRINTER
+# ═══════════════════════════════════════════════════════════════════════════════
+function Print-Section([string]$title, $rows, [string]$scanType = "") {
   $cnt = if ($rows) { @($rows).Count } else { 0 }
+
   Write-Host ""
   Write-Host "::group::$title ($cnt findings)"
-  Write-Host "${esc}[1m╔══════════════════════════════════════════════════════════════╗${esc}[0m"
-  Write-Host "${esc}[1m║  $($title.PadRight(60))║${esc}[0m"
-  Write-Host "${esc}[1m╚══════════════════════════════════════════════════════════════╝${esc}[0m"
+  Write-Host "${esc}[1m╔══════════════════════════════════════════════════════════════════════╗${esc}[0m"
+  Write-Host "${esc}[1m║  $($title.PadRight(68))║${esc}[0m"
+  Write-Host "${esc}[1m╚══════════════════════════════════════════════════════════════════════╝${esc}[0m"
+
   if ($cnt -eq 0) {
-    Write-Host "  ${esc}[1;32mNo findings.${esc}[0m"
+    Write-Host "  ${esc}[1;32m✔ No findings.${esc}[0m"
     Write-Host "::endgroup::"
     return
   }
-  Write-Host ("  " + ("{0,-36} {1,-22} {2,-10} {3,-16} {4,-16} {5,-26} {6}" -f `
-    "RULE / CVE","COMPONENT","SEVERITY","VERSION","FIXED","FILE","DESCRIPTION"))
-  Write-Host ("  " + ("-" * 160))
+
+  $hdr = "  {0,-38} {1,-24} {2,-10} {3,-18} {4,-18} {5,-30} {6}" -f `
+    "RULE / CVE", "COMPONENT", "SEVERITY", "VERSION", "FIXED", "FILE", "DESCRIPTION"
+  Write-Host $hdr
+  Write-Host ("  " + ("─" * 170))
 
   foreach ($r in $rows) {
     $col  = Sev-Color -s $r.severity
-    $line = "  ${esc}[${col}m{0,-36}${esc}[0m {1,-22} ${esc}[${col}m{2,-10}${esc}[0m {3,-16} {4,-16} {5,-26} {6}" -f `
-      (Trunc $r.displayRule 36), (Trunc $r.component 22), $r.severity, `
-      (Trunc $r.version 16), (Trunc $r.fixed 16), (Trunc $r.file 26), (Trunc $r.desc 55)
+    $line = "  ${esc}[${col}m{0,-38}${esc}[0m {1,-24} ${esc}[${col}m{2,-10}${esc}[0m {3,-18} {4,-18} {5,-30} {6}" -f `
+      (Trunc $r.displayRule 38),
+      (Trunc $r.component   24),
+      $r.severity,
+      (Trunc $r.version     18),
+      (Trunc $r.fixed       18),
+      (Trunc $r.file        30),
+      (Trunc $r.desc        60)
     Write-Host $line
   }
 
+  # Severity summary bar
   $cnts = @{}
-  foreach ($r in $rows) { $s = [string]$r.severity; $cnts[$s] = (Safe-Int $cnts[$s]) + 1 }
+  foreach ($r in $rows) {
+    $s = [string]$r.severity
+    $cnts[$s] = (Safe-Int $cnts[$s]) + 1
+  }
   $parts = @("CRITICAL","HIGH","MEDIUM","LOW","INFORMATIONAL","UNKNOWN") |
     Where-Object { $cnts[$_] } |
     ForEach-Object { $c = Sev-Color -s $_; "${esc}[${c}m${_}: $($cnts[$_])${esc}[0m" }
-  Write-Host ""; Write-Host "  Summary: $($parts -join '  |  ')"
+
+  Write-Host ""
+  Write-Host "  ┌─ Severity Summary: $($parts -join '  │  ') ─┐"
+
+  # GHA annotations for critical/high
+  foreach ($r in ($rows | Where-Object { $_.severity -in @("CRITICAL","HIGH") } | Select-Object -First 20)) {
+    $lvl = Sev-GhaLevel $r.severity
+    Write-Host "::${lvl} title=[Wiz Cloud] $($r.severity) in $($r.component)::$($r.cveId) — $($r.component) $($r.version) — Fix: $($r.fixed)"
+  }
+
   Write-Host "::endgroup::"
 }
 
-# ── SECTION 1: Container Image (image.sarif) ─────────────────────────────────
-$imageSarif     = Get-Json -Path $ImageSarifPath
-$containerRows  = [System.Collections.Generic.List[object]]::new()
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 1 — Container Image Vulnerabilities  (image.sarif)
+# ═══════════════════════════════════════════════════════════════════════════════
+Write-Host ""
+Write-Host "${esc}[1;36m══════════════════════════════════════════════════════${esc}[0m"
+Write-Host "${esc}[1;36m  WIZ SECURITY SCAN — UNIFIED REPORT${esc}[0m"
+Write-Host "${esc}[1;36m══════════════════════════════════════════════════════${esc}[0m"
+
+$imageSarif    = Get-Json -Path $ImageSarifPath
+$containerRows = @()
 
 if ($imageSarif) {
-  Write-Host "::group::Enriching image.sarif"
+  Write-Host ""
+  Write-Host "::group::Enriching image.sarif (Container Vulnerabilities)"
   $imageSarif = Enrich-Sarif -sarif $imageSarif
-  $imageSarif | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $ImageSarifPath -Encoding utf8
-  Write-Host "  image.sarif enriched with security-severity."
+  $imageSarif | ConvertTo-Json -Depth 100 -Compress | Set-Content -LiteralPath $ImageSarifPath -Encoding utf8NoBOM
+  Write-Host "  ✔ image.sarif enriched and written back."
   Write-Host "::endgroup::"
-  $containerRows = Get-SarifRows -sarif $imageSarif
-  Print-Section -title "Container Image Vulnerabilities" -rows $containerRows
+  $containerRows = @(Get-SarifRows -sarif $imageSarif)
+  Print-Section -title "Container Image Vulnerabilities (image.sarif)" -rows $containerRows -scanType "container"
 } else {
-  Write-Host "[INFO] image.sarif not found or empty: $ImageSarifPath"
+  Write-Host "[INFO] image.sarif not found — skipping container enrichment: $ImageSarifPath"
 }
 
-# ── SECTION 2: Per-Layer Report (image-layers.json) ──────────────────────────
-$layerJson    = Get-Json -Path $ImageLayersPath
-$layerGroups  = [ordered]@{}
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 2 — Per-Layer Vulnerability Report  (image-layers.json)
+# ═══════════════════════════════════════════════════════════════════════════════
+$layerJson   = Get-Json -Path $ImageLayersPath
+$layerGroups = [ordered]@{}
 
 if ($layerJson) {
-  $lr = if ($layerJson.result) { $layerJson.result } else { $layerJson }
+  # Wiz JSON: top-level result object with osPackages / libraries / applications
+  $lr = if ((Get-Prop $layerJson "result" $null)) { $layerJson.result } else { $layerJson }
+
   $allPkgs = [System.Collections.Generic.List[object]]::new()
   foreach ($key in @("osPackages","libraries","applications")) {
-    $items = $lr.$key
+    $items = Get-Prop $lr $key $null
     if ($items) { foreach ($i in $items) { if ($i) { $allPkgs.Add($i) } } }
   }
 
+  Write-Host ""
+  Write-Host "::group::Parsing image-layers.json ($($allPkgs.Count) packages found)"
+
   foreach ($pkg in $allPkgs) {
     if (-not $pkg) { continue }
-    $vulns = $pkg.vulnerabilities
+
+    $vulns = Get-Prop $pkg "vulnerabilities" $null
     if (-not $vulns -or @($vulns).Count -eq 0) { continue }
-    $meta = $pkg.layerMetadata
-    if (-not $meta -or $meta -isnot [psobject]) { continue }
 
+    $meta = Get-Prop $pkg "layerMetadata" $null
+    if ($null -eq $meta) { continue }
+
+    # Digest / layer ID — try multiple field names Wiz uses
     $lid = ""
-    foreach ($f in @("id","layerId","layerID","digest","layerDigest","sha","hash")) {
-      $v = $meta.$f; if ($v) { $lid = [string]$v; break }
+    foreach ($fn in @("id","layerId","layerID","digest","layerDigest","sha","hash","shortId")) {
+      $v = Get-Prop $meta $fn $null
+      if ($v) { $lid = [string]$v; break }
     }
-    if (-not $lid) { $lid = "unknown" }
+    if (-not $lid) { $lid = "layer-unknown" }
 
+    # Dockerfile instruction — "details" is Wiz's field name
     $instr = ""
-    foreach ($f in @("details","createdBy","instruction","command","cmd","layerInstruction")) {
-      $v = $meta.$f; if ($v) { $instr = [string]$v; break }
+    foreach ($fn in @("details","createdBy","instruction","command","cmd","layerInstruction","step")) {
+      $v = Get-Prop $meta $fn $null
+      if ($v) { $instr = [string]$v; break }
     }
 
-    $lidx = 999
-    foreach ($f in @("index","layerIndex","order")) {
-      $v = $meta.$f
+    # Layer order index
+    $lidx = 9999
+    foreach ($fn in @("index","layerIndex","order","position")) {
+      $v = Get-Prop $meta $fn $null
       if ($null -ne $v) { try { $lidx = [int]$v; break } catch {} }
     }
-    $isBase = ($meta.isBaseLayer -eq $true)
+
+    $isBase = ((Get-Prop $meta "isBaseLayer" $null) -eq $true)
 
     if (-not $layerGroups.Contains($lid)) {
       $layerGroups[$lid] = [ordered]@{
@@ -367,208 +540,280 @@ if ($layerJson) {
         findings = [System.Collections.Generic.List[object]]::new()
       }
     }
+
     foreach ($v in $vulns) {
       if (-not $v) { continue }
+      $vsev = (Safe-Str (Get-Prop $v "severity" "UNKNOWN") "UNKNOWN").ToUpper()
+      if ($vsev -eq "INFO") { $vsev = "INFORMATIONAL" }
       $layerGroups[$lid].findings.Add([ordered]@{
-        cve = Safe-Str $v.name "N/A"
-        sev = (Safe-Str $v.severity "UNKNOWN").ToUpper()
-        pkg = Safe-Str $pkg.name "N/A"
-        ver = Safe-Str $pkg.version "N/A"
-        fix = Safe-Str $v.fixedVersion "no fix"
+        cve = Safe-Str (Get-Prop $v "name" "N/A") "N/A"
+        sev = $vsev
+        pkg = Safe-Str (Get-Prop $pkg "name" "N/A") "N/A"
+        ver = Safe-Str (Get-Prop $pkg "version" "N/A") "N/A"
+        fix = Safe-Str (Get-Prop $v "fixedVersion" "no fix") "no fix"
       })
     }
   }
 
+  Write-Host "  Layers with vulnerabilities: $($layerGroups.Count)"
+  Write-Host "::endgroup::"
+
   if ($layerGroups.Count -gt 0) {
     Write-Host ""
-    Write-Host "::group::Per-Layer Vulnerability Report ($($layerGroups.Count) layers)"
-    Write-Host "${esc}[1m╔══════════════════════════════════════════════════════════════╗${esc}[0m"
-    Write-Host "${esc}[1m║  PER-LAYER VULNERABILITY REPORT                              ║${esc}[0m"
-    Write-Host "${esc}[1m╚══════════════════════════════════════════════════════════════╝${esc}[0m"
+    Write-Host "::group::Per-Layer Vulnerability Report ($($layerGroups.Count) layers with findings)"
+    Write-Host "${esc}[1m╔══════════════════════════════════════════════════════════════════════╗${esc}[0m"
+    Write-Host "${esc}[1m║  PER-LAYER VULNERABILITY BREAKDOWN                                   ║${esc}[0m"
+    Write-Host "${esc}[1m╚══════════════════════════════════════════════════════════════════════╝${esc}[0m"
 
     $lIdx = 0
-    foreach ($entry in ($layerGroups.GetEnumerator() | Sort-Object { $_.Value.index })) {
+    $sortedLayers = $layerGroups.GetEnumerator() | Sort-Object { [int]$_.Value.index }
+
+    foreach ($entry in $sortedLayers) {
       $lIdx++
-      $lid   = $entry.Key
-      $lpay  = $entry.Value
+      $lid    = $entry.Key
+      $lpay   = $entry.Value
       $lfinds = @($lpay.findings)
+
       $lc = @($lfinds | Where-Object { $_.sev -eq "CRITICAL" }).Count
       $lh = @($lfinds | Where-Object { $_.sev -eq "HIGH" }).Count
       $lm = @($lfinds | Where-Object { $_.sev -eq "MEDIUM" }).Count
       $ll = @($lfinds | Where-Object { $_.sev -eq "LOW" }).Count
+      $li = @($lfinds | Where-Object { $_.sev -eq "INFORMATIONAL" }).Count
       $btag = if ($lpay.isBase) { " ${esc}[1;34m[BASE IMAGE]${esc}[0m" } else { "" }
 
       Write-Host ""
-      Write-Host "${esc}[1mLayer #${lIdx}${esc}[0m${btag}  Digest: $(Trunc $lid 55)"
-      if ($lpay.instr) { Write-Host "  ${esc}[2mInstruction: $(Trunc $lpay.instr 160)${esc}[0m" }
-      Write-Host ("  Findings: $($lfinds.Count)  |  " +
-        "${esc}[1;37;41mCRIT: $lc${esc}[0m  " +
-        "${esc}[1;31mHIGH: $lh${esc}[0m  " +
-        "${esc}[1;33mMED:  $lm${esc}[0m  " +
-        "${esc}[1;32mLOW:  $ll${esc}[0m")
+      Write-Host "${esc}[1;36m▶ Layer #${lIdx}${esc}[0m${btag}  ${esc}[2m$(Trunc $lid 72)${esc}[0m"
+      if ($lpay.instr) {
+        Write-Host "  ${esc}[2mInstruction: $(Trunc $lpay.instr 180)${esc}[0m"
+      }
+      Write-Host ("  Total: $($lfinds.Count)  " +
+        "${esc}[1;37;41m CRIT:$lc ${esc}[0m " +
+        "${esc}[1;31m HIGH:$lh ${esc}[0m " +
+        "${esc}[1;33m MED:$lm ${esc}[0m " +
+        "${esc}[1;32m LOW:$ll ${esc}[0m " +
+        "${esc}[0;37m INFO:$li ${esc}[0m")
 
-      $seen = @{}
+      # Dedup by pkg+cve, sort by severity
+      $seen    = @{}
       $deduped = [System.Collections.Generic.List[object]]::new()
-      foreach ($lf in ($lfinds | Sort-Object { $sevOrder[$_.sev] })) {
+      foreach ($lf in ($lfinds | Sort-Object { Sev-Rank $_.sev })) {
         $k = "$($lf.pkg)|$($lf.cve)"
         if (-not $seen.ContainsKey($k)) { $seen[$k] = 1; $deduped.Add($lf) }
       }
-      $top = @($deduped | Select-Object -First 5)
-      Write-Host "  $("{0,-20} {1,-10} {2,-28} {3,-18} {4}" -f "CVE","SEV","COMPONENT","VERSION","FIXED")"
-      Write-Host "  $("-" * 100)"
-      foreach ($lf in $top) {
+
+      Write-Host "  $("{0,-22} {1,-10} {2,-30} {3,-20} {4}" -f "CVE","SEVERITY","PACKAGE","VERSION","FIXED")"
+      Write-Host "  $("─" * 110)"
+      foreach ($lf in ($deduped | Select-Object -First 10)) {
         $col = Sev-Color -s $lf.sev
-        Write-Host ("  ${esc}[${col}m$("{0,-20}" -f (Trunc $lf.cve 20))${esc}[0m " +
-          "$("{0,-10} {1,-28} {2,-18} {3}" -f $lf.sev, (Trunc $lf.pkg 28), (Trunc $lf.ver 18), (Trunc $lf.fix 18))")
+        Write-Host ("  ${esc}[${col}m$("{0,-22}" -f (Trunc $lf.cve 22))${esc}[0m " +
+          "$("{0,-10} {1,-30} {2,-20} {3}" -f $lf.sev, (Trunc $lf.pkg 30), (Trunc $lf.ver 20), (Trunc $lf.fix 20))")
       }
-      if ($deduped.Count -gt 5) { Write-Host "  ${esc}[2m... and $($deduped.Count - 5) more vulnerabilities in this layer${esc}[0m" }
+      if ($deduped.Count -gt 10) {
+        Write-Host "  ${esc}[2m  … and $($deduped.Count - 10) more unique vulnerabilities in this layer${esc}[0m"
+      }
     }
+    Write-Host ""
     Write-Host "::endgroup::"
   } else {
-    Write-Host "[INFO] No layer vulnerability data found in: $ImageLayersPath"
+    Write-Host "[INFO] No layer vulnerability findings in: $ImageLayersPath"
   }
 } else {
-  Write-Host "[INFO] image-layers.json not found or empty: $ImageLayersPath"
+  Write-Host "[INFO] image-layers.json not found — skipping layer report: $ImageLayersPath"
 }
 
-# ── SECTION 3: SCA — Source Dependencies (dir.sarif) ─────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 3 — Source Dependencies (SCA)  (dir.sarif)
+# ═══════════════════════════════════════════════════════════════════════════════
 $scaSarif = Get-Json -Path $DirSarifPath
-$scaRows  = [System.Collections.Generic.List[object]]::new()
+$scaRows  = @()
 
 if ($scaSarif) {
+  Write-Host ""
+  Write-Host "::group::Enriching dir.sarif (SCA — Source Dependencies)"
   $scaSarif = Enrich-Sarif -sarif $scaSarif
-  $scaSarif | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $DirSarifPath -Encoding utf8
-  $scaRows = Get-SarifRows -sarif $scaSarif
-  Print-Section -title "Source Dependencies — SCA (dir.sarif)" -rows $scaRows
+  $scaSarif | ConvertTo-Json -Depth 100 -Compress | Set-Content -LiteralPath $DirSarifPath -Encoding utf8NoBOM
+  Write-Host "  ✔ dir.sarif enriched and written back."
+  Write-Host "::endgroup::"
+  $scaRows = @(Get-SarifRows -sarif $scaSarif)
+  Print-Section -title "Source Dependencies — SCA (dir.sarif)" -rows $scaRows -scanType "sca"
 } else {
-  Write-Host "[INFO] SCA SARIF not found or empty: $DirSarifPath"
+  Write-Host "[INFO] dir.sarif not found — skipping SCA enrichment: $DirSarifPath"
 }
 
-# ── SECTION 4: IaC — Dockerfile Misconfigurations (dockerfile.sarif) ─────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 4 — Dockerfile Misconfigurations (IaC)  (dockerfile.sarif)
+# ═══════════════════════════════════════════════════════════════════════════════
 $iacSarif = Get-Json -Path $DockerfileSarifPath
-$iacRows  = [System.Collections.Generic.List[object]]::new()
+$iacRows  = @()
 
 if ($iacSarif) {
+  Write-Host ""
+  Write-Host "::group::Enriching dockerfile.sarif (IaC — Dockerfile Misconfigurations)"
   $iacSarif = Enrich-Sarif -sarif $iacSarif
-  $iacSarif | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $DockerfileSarifPath -Encoding utf8
-  $iacRows = Get-SarifRows -sarif $iacSarif
-  Print-Section -title "Dockerfile Misconfigurations — IaC (dockerfile.sarif)" -rows $iacRows
+  $iacSarif | ConvertTo-Json -Depth 100 -Compress | Set-Content -LiteralPath $DockerfileSarifPath -Encoding utf8NoBOM
+  Write-Host "  ✔ dockerfile.sarif enriched and written back."
+  Write-Host "::endgroup::"
+  $iacRows = @(Get-SarifRows -sarif $iacSarif)
+  Print-Section -title "Dockerfile Misconfigurations — IaC (dockerfile.sarif)" -rows $iacRows -scanType "iac"
 } else {
-  Write-Host "[INFO] IaC SARIF not found or empty: $DockerfileSarifPath"
+  Write-Host "[INFO] dockerfile.sarif not found — skipping IaC enrichment: $DockerfileSarifPath"
 }
 
-# ── SECTION 5: GitHub Job Summary ─────────────────────────────────────────────
-function Count-BySev($rows, [string]$sev) {
-  if (-not $rows) { return 0 }
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 5 — GitHub Job Summary (Markdown)
+# ═══════════════════════════════════════════════════════════════════════════════
+function Count-Sev($rows, [string]$sev) {
+  if (-not $rows -or @($rows).Count -eq 0) { return 0 }
   return @($rows | Where-Object { $_.severity -eq $sev }).Count
 }
+
+$cCrit = Count-Sev $containerRows "CRITICAL"; $cHigh = Count-Sev $containerRows "HIGH"
+$cMed  = Count-Sev $containerRows "MEDIUM";   $cLow  = Count-Sev $containerRows "LOW"
+$sCrit = Count-Sev $scaRows "CRITICAL";       $sHigh = Count-Sev $scaRows "HIGH"
+$sMed  = Count-Sev $scaRows "MEDIUM";         $sLow  = Count-Sev $scaRows "LOW"
+$iCrit = Count-Sev $iacRows "CRITICAL";       $iHigh = Count-Sev $iacRows "HIGH"
+$iMed  = Count-Sev $iacRows "MEDIUM";         $iLow  = Count-Sev $iacRows "LOW"
+
+$totalCrit = $cCrit + $sCrit + $iCrit
+$totalHigh = $cHigh + $sHigh + $iHigh
+
+$statusBadge = if ($totalCrit -gt 0) { "🔴 CRITICAL issues found" }
+               elseif ($totalHigh -gt 0) { "🟠 HIGH issues found" }
+               else { "🟢 No critical/high issues" }
 
 $md = [System.Collections.Generic.List[string]]::new()
 $md.Add("# Wiz Security Scan Report")
 $md.Add("")
-if ($GitHubRunUrl) { $md.Add("> **CI Run:** $GitHubRunUrl") }
-$md.Add("> **AppSec:** $AppSecContact")
+$md.Add("**Status:** $statusBadge")
+$md.Add("")
+if ($GitHubRunUrl) { $md.Add("> **CI Run:** [$GitHubRunUrl]($GitHubRunUrl)") }
+$md.Add("> **AppSec Contact:** $AppSecContact")
 $md.Add("")
 
-$cCrit = Count-BySev $containerRows "CRITICAL"; $cHigh = Count-BySev $containerRows "HIGH"
-$cMed  = Count-BySev $containerRows "MEDIUM";  $cLow  = Count-BySev $containerRows "LOW"
-$sCrit = Count-BySev $scaRows "CRITICAL";      $sHigh = Count-BySev $scaRows "HIGH"
-$sMed  = Count-BySev $scaRows "MEDIUM";        $sLow  = Count-BySev $scaRows "LOW"
-$iCrit = Count-BySev $iacRows "CRITICAL";      $iHigh = Count-BySev $iacRows "HIGH"
-$iMed  = Count-BySev $iacRows "MEDIUM";        $iLow  = Count-BySev $iacRows "LOW"
-
-$md.Add("## Summary")
+# ── Summary table ─────────────────────────────────────────────────────────────
+$md.Add("## Scan Summary")
 $md.Add("")
-$md.Add("| Scan Type | Findings | Critical | High | Medium | Low |")
+$md.Add("| Scan Type | Total | 🔴 Critical | 🟠 High | 🟡 Medium | 🟢 Low |")
 $md.Add("|---|---:|---:|---:|---:|---:|")
-$md.Add("| Container Image | $(@($containerRows).Count) | $cCrit | $cHigh | $cMed | $cLow |")
-$md.Add("| Source Dependencies (SCA) | $(@($scaRows).Count) | $sCrit | $sHigh | $sMed | $sLow |")
-$md.Add("| Dockerfile IaC | $(@($iacRows).Count) | $iCrit | $iHigh | $iMed | $iLow |")
-$md.Add("| **Layers Analyzed** | **$($layerGroups.Count)** | | | | |")
+$md.Add("| 🐳 Container Image | $($containerRows.Count) | $cCrit | $cHigh | $cMed | $cLow |")
+$md.Add("| 📦 Source Dependencies (SCA) | $($scaRows.Count) | $sCrit | $sHigh | $sMed | $sLow |")
+$md.Add("| 🏗️ Dockerfile IaC | $($iacRows.Count) | $iCrit | $iHigh | $iMed | $iLow |")
+$md.Add("| **🔁 Layers Analyzed** | **$($layerGroups.Count)** | | | | |")
 $md.Add("")
 
-# Container findings table (up to 150 rows)
-if (@($containerRows).Count -gt 0) {
-  $md.Add("## Container Image Findings")
+# ── Container findings ────────────────────────────────────────────────────────
+if ($containerRows.Count -gt 0) {
+  $md.Add("## 🐳 Container Image Findings")
   $md.Add("")
-  $md.Add("| CVE / Rule | Component | Severity | Version | Fixed | Description |")
+  $md.Add("> Scan type: `wizcli docker scan --driver mountWithLayers`")
+  $md.Add("")
+  $md.Add("| CVE / Rule | Component | Severity | Installed | Fixed | Description |")
   $md.Add("|---|---|---|---|---|---|")
-  foreach ($r in ($containerRows | Select-Object -First 150)) {
-    $d = (Trunc $r.desc 100) -replace '\|','&#124;'
-    $md.Add("| ``$($r.displayRule)`` | $($r.component) | **$($r.severity)** | $($r.version) | $($r.fixed) | $d |")
+  foreach ($r in ($containerRows | Select-Object -First 200)) {
+    $d   = (Trunc $r.desc 120) -replace '\|', '&#124;'
+    $sev = $r.severity
+    $badge = switch ($sev) { "CRITICAL" {"🔴"} "HIGH" {"🟠"} "MEDIUM" {"🟡"} "LOW" {"🟢"} default {"⚪"} }
+    $md.Add("| ``$($r.displayRule)`` | $($r.component) | $badge $sev | $($r.version) | $($r.fixed) | $d |")
   }
-  if (@($containerRows).Count -gt 150) { $md.Add("_... $(@($containerRows).Count - 150) more rows omitted_") }
+  if ($containerRows.Count -gt 200) {
+    $md.Add("")
+    $md.Add("_$($containerRows.Count - 200) additional findings omitted — see uploaded SARIF artifact for full list._")
+  }
   $md.Add("")
 }
 
-# Per-layer summary
+# ── Per-layer breakdown ────────────────────────────────────────────────────────
 if ($layerGroups.Count -gt 0) {
-  $md.Add("## Per-Layer Vulnerability Report")
+  $md.Add("## 🔁 Per-Layer Vulnerability Report")
   $md.Add("")
+  $md.Add("<details><summary>Expand layer-by-layer breakdown ($($layerGroups.Count) layers with findings)</summary>")
+  $md.Add("")
+
   $lIdx = 0
-  foreach ($entry in ($layerGroups.GetEnumerator() | Sort-Object { $_.Value.index })) {
-    $lIdx++; $lid = $entry.Key; $lpay = $entry.Value
+  foreach ($entry in ($layerGroups.GetEnumerator() | Sort-Object { [int]$_.Value.index })) {
+    $lIdx++
+    $lid    = $entry.Key
+    $lpay   = $entry.Value
     $lfinds = @($lpay.findings)
     $lc = @($lfinds | Where-Object { $_.sev -eq "CRITICAL" }).Count
     $lh = @($lfinds | Where-Object { $_.sev -eq "HIGH" }).Count
     $lm = @($lfinds | Where-Object { $_.sev -eq "MEDIUM" }).Count
     $ll = @($lfinds | Where-Object { $_.sev -eq "LOW" }).Count
-    $btag = if ($lpay.isBase) { " · BASE IMAGE" } else { "" }
-    $md.Add("### Layer #${lIdx}${btag}")
-    $md.Add("**Digest:** ``$(Trunc $lid 64)``  ")
-    if ($lpay.instr) { $md.Add("**Instruction:** ``$(Trunc $lpay.instr 200)``  ") }
-    $md.Add("**Findings:** $($lfinds.Count) — Critical: $lc | High: $lh | Medium: $lm | Low: $ll")
+    $btag = if ($lpay.isBase) { " · **BASE IMAGE**" } else { "" }
+
+    $md.Add("### Layer \#${lIdx}${btag}")
+    $md.Add("- **Digest:** ``$(Trunc $lid 72)``")
+    if ($lpay.instr) { $md.Add("- **Instruction:** ``$(Trunc $lpay.instr 200)``") }
+    $md.Add("- **Findings:** $($lfinds.Count) — 🔴 Crit: $lc | 🟠 High: $lh | 🟡 Med: $lm | 🟢 Low: $ll")
     $md.Add("")
 
-    $seen = @{}; $deduped = [System.Collections.Generic.List[object]]::new()
-    foreach ($lf in ($lfinds | Sort-Object { $sevOrder[$_.sev] })) {
+    $seen    = @{}
+    $deduped = [System.Collections.Generic.List[object]]::new()
+    foreach ($lf in ($lfinds | Sort-Object { Sev-Rank $_.sev })) {
       $k = "$($lf.pkg)|$($lf.cve)"
       if (-not $seen.ContainsKey($k)) { $seen[$k] = 1; $deduped.Add($lf) }
     }
-    $md.Add("| CVE | Severity | Component | Version | Fixed |")
+    $md.Add("| CVE | Severity | Package | Version | Fixed |")
     $md.Add("|---|---|---|---|---|")
-    foreach ($lf in ($deduped | Select-Object -First 5)) {
-      $md.Add("| $($lf.cve) | **$($lf.sev)** | $($lf.pkg) | $($lf.ver) | $($lf.fix) |")
+    foreach ($lf in ($deduped | Select-Object -First 10)) {
+      $badge = switch ($lf.sev) { "CRITICAL"{"🔴"} "HIGH"{"🟠"} "MEDIUM"{"🟡"} "LOW"{"🟢"} default{"⚪"} }
+      $md.Add("| $($lf.cve) | $badge $($lf.sev) | $($lf.pkg) | $($lf.ver) | $($lf.fix) |")
     }
-    if ($deduped.Count -gt 5) { $md.Add("_... and $($deduped.Count - 5) more_") }
+    if ($deduped.Count -gt 10) { $md.Add("_… and $($deduped.Count - 10) more unique vulnerabilities in this layer_") }
     $md.Add("")
   }
+  $md.Add("</details>")
+  $md.Add("")
 }
 
-# SCA findings table
-if (@($scaRows).Count -gt 0) {
-  $md.Add("## Source Dependencies — SCA Findings")
+# ── SCA findings ──────────────────────────────────────────────────────────────
+if ($scaRows.Count -gt 0) {
+  $md.Add("## 📦 Source Dependencies — SCA Findings")
+  $md.Add("")
+  $md.Add("> Scan type: `wizcli dir scan`")
   $md.Add("")
   $md.Add("| Rule / CVE | Component | Severity | Version | Fixed | File | Description |")
   $md.Add("|---|---|---|---|---|---|---|")
   foreach ($r in ($scaRows | Select-Object -First 100)) {
-    $d = (Trunc $r.desc 100) -replace '\|','&#124;'
-    $md.Add("| ``$($r.displayRule)`` | $($r.component) | **$($r.severity)** | $($r.version) | $($r.fixed) | $($r.file) | $d |")
+    $d    = (Trunc $r.desc 100) -replace '\|', '&#124;'
+    $sev  = $r.severity
+    $badge = switch ($sev) { "CRITICAL"{"🔴"} "HIGH"{"🟠"} "MEDIUM"{"🟡"} "LOW"{"🟢"} default{"⚪"} }
+    $md.Add("| ``$($r.displayRule)`` | $($r.component) | $badge $sev | $($r.version) | $($r.fixed) | $($r.file) | $d |")
   }
-  if (@($scaRows).Count -gt 100) { $md.Add("_... $(@($scaRows).Count - 100) more rows omitted_") }
+  if ($scaRows.Count -gt 100) { $md.Add("_$($scaRows.Count - 100) additional rows omitted_") }
   $md.Add("")
 }
 
-# IaC findings table
-if (@($iacRows).Count -gt 0) {
-  $md.Add("## Dockerfile Misconfigurations — IaC Findings")
+# ── IaC findings ──────────────────────────────────────────────────────────────
+if ($iacRows.Count -gt 0) {
+  $md.Add("## 🏗️ Dockerfile Misconfigurations — IaC Findings")
   $md.Add("")
-  $md.Add("| Rule | Severity | File | Description |")
-  $md.Add("|---|---|---|---|")
+  $md.Add("> Scan type: `wizcli iac scan`")
+  $md.Add("")
+  $md.Add("| Rule | Severity | File | Line | Description |")
+  $md.Add("|---|---|---|---|---|")
   foreach ($r in ($iacRows | Select-Object -First 100)) {
-    $d = (Trunc $r.desc 120) -replace '\|','&#124;'
-    $md.Add("| ``$($r.displayRule)`` | **$($r.severity)** | $($r.file) | $d |")
+    $d    = (Trunc $r.desc 160) -replace '\|', '&#124;'
+    $sev  = $r.severity
+    $badge = switch ($sev) { "CRITICAL"{"🔴"} "HIGH"{"🟠"} "MEDIUM"{"🟡"} "LOW"{"🟢"} default{"⚪"} }
+    $md.Add("| ``$($r.displayRule)`` | $badge $sev | $($r.file) | | $d |")
   }
   $md.Add("")
 }
 
-$md | Set-Content -LiteralPath $SummaryMarkdownPath -Encoding utf8
-Write-Host "Generated: $SummaryMarkdownPath"
+# ── Footer ─────────────────────────────────────────────────────────────────────
+$md.Add("---")
+$md.Add("_Scan powered by [Wiz](https://www.wiz.io) · AppSec: $AppSecContact_")
+$md.Add("")
 
-# ── Final notices ─────────────────────────────────────────────────────────────
+$md | Set-Content -LiteralPath $SummaryMarkdownPath -Encoding utf8NoBOM
 Write-Host ""
-Write-Host "::notice::Container findings: $(@($containerRows).Count)  |  Layers analyzed: $($layerGroups.Count)"
-Write-Host "::notice::SCA findings: $(@($scaRows).Count)  |  IaC findings: $(@($iacRows).Count)"
-if ($GitHubRunUrl) { Write-Host "::notice::CI Run: $GitHubRunUrl" }
-Write-Host "::notice::AppSec contact: $AppSecContact"
+Write-Host "✔ Summary written: $SummaryMarkdownPath ($($md.Count) lines)"
+
+# ── Final GHA notices ──────────────────────────────────────────────────────────
+Write-Host ""
+Write-Host "::notice title=Wiz Scan Complete::Container: $($containerRows.Count) findings ($cCrit CRIT / $cHigh HIGH) | SCA: $($scaRows.Count) ($sCrit/$sHigh) | IaC: $($iacRows.Count) ($iCrit/$iHigh) | Layers: $($layerGroups.Count)"
+Write-Host "::notice title=AppSec Contact::$AppSecContact"
+if ($GitHubRunUrl) { Write-Host "::notice title=CI Run::$GitHubRunUrl" }
+
 exit 0
