@@ -767,7 +767,7 @@ $md.Add("")
 if ($containerRows.Count -gt 0) {
   $md.Add("## 🐳 Container Image Findings")
   $md.Add("")
-  $md.Add("> Scan type: `wizcli docker scan --driver mountWithLayers`")
+  $md.Add("> Scan type: ``wizcli docker scan --driver mountWithLayers``")
   $md.Add("")
   $md.Add("| CVE / Rule | Component | Severity | Installed | Fixed | Description |")
   $md.Add("|---|---|---|---|---|---|")
@@ -833,7 +833,7 @@ if ($layerGroups.Count -gt 0) {
 if ($scaRows.Count -gt 0) {
   $md.Add("## 📦 Source Dependencies — SCA Findings")
   $md.Add("")
-  $md.Add("> Scan type: `wizcli dir scan`")
+  $md.Add("> Scan type: ``wizcli dir scan``")
   $md.Add("")
   $md.Add("| Rule / CVE | Component | Severity | Version | Fixed | File | Description |")
   $md.Add("|---|---|---|---|---|---|---|")
@@ -851,7 +851,7 @@ if ($scaRows.Count -gt 0) {
 if ($iacRows.Count -gt 0) {
   $md.Add("## 🏗️ Dockerfile Misconfigurations — IaC Findings")
   $md.Add("")
-  $md.Add("> Scan type: `wizcli iac scan`")
+  $md.Add("> Scan type: ``wizcli iac scan``")
   $md.Add("")
   $md.Add("| Rule | Severity | File | Line | Description |")
   $md.Add("|---|---|---|---|---|")
